@@ -6,42 +6,121 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 
 ---
 
-## Architecture
+## Features
 
-```
-utxo-tracer trace <tx_hash>#<output_index>
-      │
-      ▼
-   ┌─────────────────────────────────────────┐
-   │  CLI (click) — utxo_tracer/cli.py       │
-   │  Parses args, resolves provider, runs   │
-   │  trace, prints summary, launches Dash.  │
-   └────┬────────────────────────────────┬───┘
-        │                                │
-        ▼                                ▼
-   ┌──────────┐              ┌──────────────────┐
-   │ Provider │◄────────────▶│ Tracing Engine   │
-   │ (5 back- │              │ backward /       │
-   │ ends)    │              │ forward / both   │
-   └──┬───────┘              │ Async generators │
-      │                      │ Edge-based dedup │
-      ▼                      └──────────────────┘
-   ┌──────────┐
-   │ Fallback │──► utxorpc → blockfrost → koios → maestro
-   │ Provider │    (auto-retry on transient errors)
-   └──────────┘
-        │
-        ▼
-   ┌─────────────────────────────────────────┐
-   │  Dash Cytoscape Visualization           │
-   │  - Force-directed FR layout             │
-   │  - Color-coded by address              │
-   │  - Shapes by address type               │
-   │  - CEX nodes highlighted red            │
-   │  - Click node → detail panel            │
-   │  - Auto-saves positions on exit         │
-   └─────────────────────────────────────────┘
-```
+### Tracing
+| Feature | Description |
+|---------|-------------|
+| **Backward tracing** | Walk backward from a UTXO through transaction inputs. Finds where funds **came from** — CEX withdrawal, mining reward, initial distribution. |
+| **Forward tracing** | Walk forward through spent outputs. Finds where funds **went** — hacker wallet chain → CEX deposit. Requires kupmios. |
+| **Both directions** | Runs backward then forward from the same starting UTXO. Graph shows cash-in and cash-out edges in different colors. |
+| **Edge-based deduplication** | Preserves all branches of diamond-shaped transaction patterns (both A→X and B→X edges kept). |
+| **Async generators** | Non-blocking streaming trace steps with incremental store updates. |
+| **Global store cache** | Accumulates UTXOs/edges across traces — accelerates future traces that revisit the same transactions with zero provider queries. |
+| **Input UTXO pre-caching** | When a provider returns full UTXO data alongside input refs, cache it immediately to avoid separate API calls later. |
+
+### Providers
+| Provider | Type | Backward | Forward | Auth |
+|----------|------|----------|---------|------|
+| **Blockfrost** | REST API | ✓ | ✗ | `project_id` / `bearer` / `dmtr-api-key` |
+| **Koios** | REST API | ✓ | ✗ | Bearer token (optional) |
+| **Maestro** | REST API | ✓ | ✗ | `x-api-key` |
+| **UTxORPC** | gRPC SDK | ✓ | ✓ | `x-api-key` / `dmtr-api-key` |
+| **Kupmios** | Kupo + Ogmios | ✓ | ✓ | Optional per-service |
+
+### Fallback & Resilience
+| Feature | Description |
+|---------|-------------|
+| **Auto-fallback** | Primary → utxorpc → blockfrost → koios → maestro on failure |
+| **Transient retry** | Exponential backoff (0.5s, 1s, 2s) for timeouts, connection errors, gRPC UNAVAILABLE |
+| **Capability-aware** | Skips providers that can't do backward tracing (e.g. DumpHistory unavailable) |
+| **Non-transient propagation** | ValueError, TypeError, KeyError, rate-limit (429) propagate immediately |
+
+### CLI Commands
+| Command | Description |
+|---------|-------------|
+| `utxo-tracer trace` | Full trace engine with all options |
+| `utxo-tracer health` | Check provider connectivity (single or fallback chain) |
+| `utxo-tracer assets` | Show asset breakdown for a single UTXO (ADA, native assets, datum, script ref) |
+| `utxo-tracer config set` | Save provider credentials persistently to `~/.utxo-tracer/config.json` |
+| `utxo-tracer config show` | Display current config (API keys redacted) |
+| `utxo-tracer config clear` | Remove saved config |
+| `utxo-tracer cache list` | Show all cached traces with metadata |
+| `utxo-tracer cache info` | Storage statistics (file count, store nodes, size) |
+| `utxo-tracer cache clear` | Remove all cached data |
+| `utxo-tracer open <key>` | Re-open a cached trace visualization |
+
+### Output Formats
+| Format | Description |
+|--------|-------------|
+| **Table** | Rich terminal output with summary panel, node table, CEX findings, depth tree |
+| **JSON** | Full structured output to stdout or file |
+| **CSV** | Separate `_nodes.csv` and `_edges.csv` files for analysis in spreadsheets |
+
+### Trace CLI Options
+| Option | Values | Default |
+|--------|--------|---------|
+| `--provider` | blockfrost, koios, maestro, kupmios, utxorpc | auto-detect |
+| `--direction` | backward, forward, both | backward |
+| `--max-depth` | integer | 5 |
+| `--fallback/--no-fallback` | boolean | on |
+| `--output` | table, json, csv | table |
+| `--export-json` | file path | — |
+| `--export-csv` | file path | — |
+| `--cex-file` | JSON file path | — |
+| `--depth-report` | flag | off |
+| `--no-cache` | flag | off (cached) |
+| `--use-proxy` | flag | off |
+| `--proxy-url` | URL | http://localhost:3001 |
+
+### CEX Detection
+| Feature | Description |
+|---------|-------------|
+| **Built-in registry** | Seeded with well-known exchange addresses (extensible) |
+| **Custom registry** | Load addresses from JSON file (dict or list format) |
+| **Confidence levels** | High / medium / low per entry |
+| **Detection outputs** | Summary panel, node table, depth tree, dedicated CEX findings table, graph visualization |
+
+### Visualization (Dash Cytoscape)
+| Feature | Description |
+|---------|-------------|
+| **Start position focus** | Viewport auto-zooms to the starting UTXO |
+| **Node shapes** | Circle (wallet), Diamond (script), Triangle (byron), Hexagon (stake), Square (unknown) |
+| **Fill color** | SHA-256 hash of address → HSL hue |
+| **Gold border** | Starting UTXO |
+| **Red border** | CEX address detected |
+| **Node size** | Scaled by ADA amount (logarithmic) |
+| **Force-directed layout** | Custom Fruchterman-Reingold with 120 iterations |
+| **Overlap removal** | Node–node repulsion + node–edge repulsion (dynamic gaps) |
+| **Edge styling** | Red arrows for input (backward), green arrows for output (forward) |
+| **Click node** | Right-side detail panel: address, address type badge, ADA, lovelace, output ref, CEX info, native assets |
+| **Drag nodes** | Interactive repositioning with auto-save on exit |
+| **Zoom/pan** | Scroll to zoom, click-drag background to pan |
+| **Left legend panels** | Type legend (5 address types), Address list (top 20 by ADA with colored dots), Asset list (top 30 native assets) |
+| **Viz state persistence** | Node positions, zoom, and pan saved/restored per cache key |
+
+### Cache System
+| Feature | Description |
+|---------|-------------|
+| **Location** | `.utxo-cache/` in working directory |
+| **Structure** | `index.json` (metadata), `store.json` (global UTXO + edge store), `traces/` (thin per-trace), `viz/` (visualization state) |
+| **Global store** | Accumulates UTXOs/input edges across all traces (v3 schema) |
+| **Incremental update** | Store flushed to disk at step 1 + every 5 steps during tracing |
+| **Cache-aware tracing** | Reuses stored nodes/edges, only fetches missing data from providers |
+| **Subgraph extraction** | `find_node_in_cache()` — O(1) lookup from store, BFS expansion in any direction |
+| **Re-trace on errors** | Detects cached results with errors and re-fetches missing UTXOs |
+| **Fresh node dedup** | Skips empty-address error placeholders that would pollute the store |
+
+### Configuration System
+| Feature | Description |
+|---------|-------------|
+| **Priority** | CLI flags > shell env vars > .env file > `~/.utxo-tracer/config.json` > defaults |
+| **.env discovery** | Auto-searched from cwd → parent directories → `~/.utxo-tracer/.env` |
+| **Auth types** | Blockfrost: project_id, bearer, dmtr-api-key |
+| **Persistent save** | `utxo-tracer config set` writes to config.json (atomic temp+rename, chmod 600) |
+| **Shell override warning** | Warns when shell env vars silently override .env values |
+| **Proxy support** | Route API calls through a local proxy |
+| **Demeter.run support** | `dmtr-api-key` auth + endpoint URL for all compatible providers |
 
 ---
 
@@ -227,14 +306,6 @@ Or as a list:
 
 ## Providers
 
-| Provider | Type | Backward | Forward | Auth |
-|----------|------|----------|---------|------|
-| **Blockfrost** | REST API | ✓ | ✗ | `project_id` / `bearer` / `dmtr-api-key` |
-| **Koios** | REST API | ✓ | ✗ | Bearer token (optional) |
-| **Maestro** | REST API | ✓ | ✗ | `x-api-key` |
-| **UTxORPC** | gRPC SDK | ✓ | ✓ | `x-api-key` / `dmtr-api-key` |
-| **Kupmios** | Kupo + Ogmios | ✓ | ✓ | Optional per-service |
-
 ### Fallback chain
 
 By default, fallback is enabled. If the primary provider fails, the tool tries:
@@ -318,7 +389,7 @@ After every trace, a Dash Cytoscape graph opens at `http://127.0.0.1:8050`.
 
 ### Interactions
 
-- **Click a node** → right-side detail panel shows address, ADA amount, assets
+- **Click a node** → right-side detail panel shows address, ADA amount, assets, address type badge
 - **Drag nodes** → positions are auto-saved on exit
 - **Scroll** → zoom in/out
 - **Pan** → click and drag background
@@ -353,6 +424,45 @@ utxo-tracer open <key>   # Re-open a cached trace visualization
 ```
 
 Use `--no-cache` to skip local cache entirely and always query providers.
+
+---
+
+## Architecture
+
+```
+utxo-tracer trace <tx_hash>#<output_index>
+      │
+      ▼
+   ┌─────────────────────────────────────────┐
+   │  CLI (click) — utxo_tracer/cli.py       │
+   │  Parses args, resolves provider, runs   │
+   │  trace, prints summary, launches Dash.  │
+   └────┬────────────────────────────────┬───┘
+        │                                │
+        ▼                                ▼
+   ┌──────────┐              ┌──────────────────┐
+   │ Provider │◄────────────►│ Tracing Engine   │
+   │ (5 back- │              │ backward /       │
+   │ ends)    │              │ forward / both   │
+   └──┬───────┘              │ Async generators │
+      │                      │ Edge-based dedup │
+      ▼                      └──────────────────┘
+   ┌──────────┐
+   │ Fallback │──► utxorpc → blockfrost → koios → maestro
+   │ Provider │    (auto-retry on transient errors)
+   └──────────┘
+        │
+        ▼
+   ┌─────────────────────────────────────────┐
+   │  Dash Cytoscape Visualization           │
+   │  - Force-directed FR layout             │
+   │  - Color-coded by address              │
+   │  - Shapes by address type               │
+   │  - CEX nodes highlighted red            │
+   │  - Click node → detail panel            │
+   │  - Auto-saves positions on exit         │
+   └─────────────────────────────────────────┘
+```
 
 ---
 
