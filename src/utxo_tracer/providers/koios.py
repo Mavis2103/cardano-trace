@@ -145,3 +145,55 @@ class KoiosProvider(Provider):
             return {"inputs": inputs, "input_utxos": input_utxos, "outputs": outputs}
         except Exception:
             return {"inputs": [], "outputs": []}
+
+    async def get_tx_block_time(self, tx_hash: str) -> int | None:
+        """Fetch block time for a transaction from Koios."""
+        try:
+            body = {"_tx_hashes": [tx_hash]}
+            r = await self._client.post("/tx_info", json=body)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            arr = r.json()
+            if not arr:
+                return None
+            return arr[0].get("block_time")
+        except Exception:
+            return None
+
+    async def get_spent_utxos(self, address: str) -> list[OutRef]:
+        """Find transactions that spent UTXOs from this address (forward tracing).
+
+        Uses Koios /address_txs to find all TXs involving the address,
+        then checks which ones have this address as input.
+
+        Returns list of OutRefs for the spent outputs.
+        """
+        try:
+            body = {"_addresses": [address]}
+            r = await self._client.post("/address_txs", json=body)
+            if r.status_code == 404:
+                return []
+            r.raise_for_status()
+            txs = r.json()
+        except Exception:
+            return []
+
+        spent_refs: list[OutRef] = []
+        seen_tx_hashes: set[str] = set()
+
+        for tx in txs:
+            tx_hash = tx.get("tx_hash", "")
+            if not tx_hash or tx_hash in seen_tx_hashes:
+                continue
+            seen_tx_hashes.add(tx_hash)
+
+            try:
+                tx_data = await self.get_transaction_utxos(tx_hash)
+                for inp in tx_data.get("inputs", []):
+                    if inp.tx_hash:
+                        spent_refs.append(inp)
+            except Exception:
+                continue
+
+        return spent_refs

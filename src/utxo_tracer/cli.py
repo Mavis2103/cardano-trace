@@ -49,6 +49,16 @@ def _fatal(msg: str, exit_code: int = 1) -> NoReturn:
     sys.exit(exit_code)
 
 
+def _fmt_ts(ts: int) -> str:
+    """Format a Unix timestamp as a readable date string."""
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (OSError, ValueError, OverflowError):
+        return str(ts)
+
+
 def _open_browser() -> None:
     import webbrowser
     try:
@@ -95,11 +105,6 @@ def _build_providers(
     use_proxy: bool,
     proxy_url: str,
 ) -> Provider:
-    """Build a single provider or a FallbackProvider chain.
-
-    When use_fallback=True, the specified provider is tried first, then
-    utxorpc → blockfrost → koios → maestro in that order as fallback.
-    """
     provider_cfg = (cfg.get("providers") or {}).get(name, {}) or {}
     overrides = {
         "api_key": api_key,
@@ -113,39 +118,30 @@ def _build_providers(
 
     if not use_fallback:
         return build_provider(
-            name,
-            provider_cfg,
-            use_proxy=use_proxy,
-            proxy_url=proxy_url,
-            overrides=overrides,
+            name, provider_cfg,
+            use_proxy=use_proxy, proxy_url=proxy_url, overrides=overrides,
         )
 
-    # Build fallback chain: primary first, then other providers
     _FALLBACK_ORDER = ["utxorpc", "blockfrost", "koios", "maestro"]
     order = _FALLBACK_ORDER[:]
     if name in order:
         order.remove(name)
-    order.insert(0, name)  # primary first, then remaining chain
+    order.insert(0, name)
 
     providers: list[tuple[str, Provider]] = []
     for pname in order:
         p_cfg = (cfg.get("providers") or {}).get(pname, {}) or {}
         try:
             p = build_provider(
-                pname,
-                p_cfg,
-                use_proxy=use_proxy,
-                proxy_url=proxy_url,
-                overrides=overrides,
+                pname, p_cfg,
+                use_proxy=use_proxy, proxy_url=proxy_url, overrides=overrides,
             )
             providers.append((pname, p))
         except Exception as e:
             logging.getLogger(__name__).warning("Skipping provider %s: %s", pname, e)
             continue
-
     if not providers:
         _fatal("No providers could be built for fallback chain")
-
     return _FallbackProvider(providers)
 
 
@@ -153,69 +149,84 @@ def _print_summary(result: TraceResult) -> None:
     n_cex = sum(1 for n in result.nodes if identify_cex(n.address) is not None)
     total_ada = sum(n.ada for n in result.nodes)
     panel = Panel.fit(
-        "\n".join(
-            [
-                f"[bold]Start:[/bold] {result.start_out_ref}",
-                f"[bold]Direction:[/bold] {result.direction}",
-                f"[bold]Max depth:[/bold] {result.max_depth}",
-                f"[bold]Provider:[/bold] {getattr(result, 'provider_name', '') or 'fallback'}",
-                f"[bold]Nodes:[/bold] {len(result.nodes)}",
-                f"[bold]Edges:[/bold] {len(result.edges)}",
-                f"[bold]CEX hits:[/bold] {n_cex}",
-                f"[bold]Total ADA across nodes:[/bold] {total_ada:,.6f}",
-            ]
-        ),
-        title="UTXO Trace Summary",
-        border_style="cyan",
+        "\n".join([
+            f"[bold]Start:[/bold] {result.start_out_ref}",
+            f"[bold]Direction:[/bold] {result.direction}",
+            f"[bold]Max depth:[/bold] {result.max_depth}",
+            f"[bold]Provider:[/bold] {getattr(result, 'provider_name', '') or 'fallback'}",
+            f"[bold]Nodes:[/bold] {len(result.nodes)}",
+            f"[bold]Edges:[/bold] {len(result.edges)}",
+            f"[bold]CEX hits:[/bold] {n_cex}",
+            f"[bold]Total ADA across nodes:[/bold] {total_ada:,.6f}",
+        ]),
+        title="UTXO Trace Summary", border_style="cyan",
     )
     console.print(panel)
 
-
 def _print_nodes_table(result: TraceResult) -> None:
-    table = Table(title="Nodes", header_style="bold magenta")
+    nodes = result.nodes
+    n_total = len(nodes)
+    cex_cache: dict[str, str] = {}
+    type_cache: dict[str, str] = {}
+    for n in nodes:
+        addr = n.address
+        if addr not in cex_cache:
+            ci = identify_cex(addr)
+            cex_cache[addr] = f"{ci.name} ({ci.confidence})" if ci else ""
+            type_cache[addr] = n.address_type
+    SHOW_TOP = 100 if n_total <= 150 else 50
+    show_nodes = nodes[:SHOW_TOP]
+    _TYPE_LABEL_MAP = {
+        "wallet": "[blue]W[/blue]",
+        "script": "[yellow]S[/yellow]",
+        "byron":  "[magenta]B[/magenta]",
+        "stake":  "[green]K[/green]",
+        "unknown": "[dim]?[/dim]",
+    }
+    table = Table(title=f"Nodes ({n_total})" + ("" if n_total == len(show_nodes)
+                  else f" — showing top {SHOW_TOP}"), header_style="bold magenta")
     table.add_column("Node", style="dim", overflow="fold")
     table.add_column("Address", overflow="fold")
     table.add_column("Type", justify="center")
     table.add_column("ADA", justify="right")
     table.add_column("Assets", overflow="fold")
     table.add_column("CEX")
-
-    for n in result.nodes:
-        cex = identify_cex(n.address)
-        if cex:
+    cex_seen: set[str] = set()
+    for n in show_nodes:
+        addr = n.address
+        cex_label = cex_cache[addr]
+        if cex_label:
             row_style = "bold red"
+            cex_seen.add(cex_label)
         elif n.ada >= 100:
             row_style = "yellow"
         else:
             row_style = "green"
-
         non_ada = [a for a in n.assets if not a.is_lovelace]
         if non_ada:
             asset_strs = [f"{a.unit}: {a.quantity:,}" for a in non_ada]
-            # First asset on same line, rest joined
             assets_display = asset_strs[0]
             if len(asset_strs) > 1:
                 assets_display += f" [dim](+{len(asset_strs)-1})[/dim]"
         else:
             assets_display = "-"
-
-        _type_label_map = {
-            "wallet": "[blue]W[/blue]",
-            "script": "[yellow]S[/yellow]",
-            "byron":  "[magenta]B[/magenta]",
-            "stake":  "[green]K[/green]",
-            "unknown": "[dim]?[/dim]",
-        }
-        type_display = _type_label_map.get(n.address_type, "[dim]?[/dim]")
-
+        type_display = _TYPE_LABEL_MAP.get(type_cache[addr], "[dim]?[/dim]")
         table.add_row(
             shorten(n.id, 18, 6),
-            shorten(n.address, 14, 8),
+            shorten(addr, 14, 8),
             type_display,
             f"{n.ada:,.6f}",
             assets_display,
-            f"{cex.name} ({cex.confidence})" if cex else "-",
+            cex_label if cex_label else "-",
             style=row_style,
+        )
+    n_hidden = n_total - len(show_nodes)
+    if n_hidden > 0:
+        hidden_cex = sum(1 for n in nodes[SHOW_TOP:] if cex_cache.get(n.address, ""))
+        hidden_ada = sum(n.ada for n in nodes[SHOW_TOP:])
+        table.add_row(
+            f"[dim]... {n_hidden} more[/dim]", "", "", f"[dim]{hidden_ada:,.0f}[/dim]",
+            f"[dim]({hidden_cex} CEX)[/dim]", "", style="dim", end_section=True,
         )
     console.print(table)
 
@@ -234,7 +245,6 @@ def _print_depth_tree(result: TraceResult, steps: list[TraceStep]) -> None:
                 label += f" [red]({child.error[:40]})[/red]"
             elif child.utxo:
                 label += f" [green]{child.utxo.ada:.2f} ADA[/green]"
-                # Address type badge
                 _atype = child.utxo.address_type
                 if _atype == "script":
                     label += " [yellow]S[/yellow]"
@@ -283,11 +293,8 @@ def _print_cex_findings(result: TraceResult) -> None:
     table.add_column("Address", overflow="fold")
     for n, cex in findings:
         table.add_row(
-            shorten(n.id, 18, 6),
-            cex.name,
-            cex.confidence,
-            f"{n.ada:,.6f}",
-            n.address,
+            shorten(n.id, 18, 6), cex.name, cex.confidence,
+            f"{n.ada:,.6f}", n.address,
         )
     console.print(table)
 
@@ -307,12 +314,8 @@ def _export_json(result: TraceResult, path: str) -> None:
                 "lovelace": n.lovelace,
                 "ada": round(n.ada, 6),
                 "assets": [
-                    {
-                        "policy_id": a.policy_id,
-                        "asset_name": a.asset_name,
-                        "quantity": a.quantity,
-                        "unit": a.unit,
-                    }
+                    {"policy_id": a.policy_id, "asset_name": a.asset_name,
+                     "quantity": a.quantity, "unit": a.unit}
                     for a in n.assets
                 ],
                 "datum_hash": n.datum_hash,
@@ -323,12 +326,8 @@ def _export_json(result: TraceResult, path: str) -> None:
         ],
         "edges": [
             {
-                "id": e.id,
-                "source": e.source,
-                "target": e.target,
-                "direction": e.direction,
-                "tx_hash": e.tx_hash,
-                "fee": e.fee,
+                "id": e.id, "source": e.source, "target": e.target,
+                "direction": e.direction, "tx_hash": e.tx_hash, "fee": e.fee,
             }
             for e in result.edges
         ],
@@ -347,20 +346,10 @@ def _export_json(result: TraceResult, path: str) -> None:
             for s in result.steps
         ],
     }
-    Path(path).write_text(
-        jsonlib.dumps(payload, indent=2, default=str), encoding="utf-8"
-    )
+    Path(path).write_text(jsonlib.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
 def _export_csv(result: TraceResult, base_path: str) -> tuple[str, str]:
-    """Export nodes + edges as CSV files.
-
-    If base_path ends with ``.csv``, the stem is used as a file prefix:
-    ``<stem>_nodes.csv`` and ``<stem>_edges.csv``.
-
-    Otherwise, base_path is treated as a directory (created if needed):
-    ``<base_path>/nodes.csv`` and ``<base_path>/edges.csv``.
-    """
     base = Path(base_path)
     if base.suffix.lower() == ".csv":
         stem = base.with_suffix("")
@@ -370,52 +359,22 @@ def _export_csv(result: TraceResult, base_path: str) -> tuple[str, str]:
         base.mkdir(parents=True, exist_ok=True)
         nodes_path = str(base / "nodes.csv")
         edges_path = str(base / "edges.csv")
-
     with open(nodes_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(
-            [
-                "id",
-                "tx_hash",
-                "output_index",
-                "address",
-                "lovelace",
-                "ada",
-                "asset_count",
-                "datum_hash",
-                "has_inline_datum",
-                "has_script_ref",
-                "is_cex",
-                "cex_name",
-            ]
-        )
+        w.writerow(["id", "tx_hash", "output_index", "address", "lovelace", "ada",
+                     "asset_count", "datum_hash", "has_inline_datum", "has_script_ref",
+                     "is_cex", "cex_name"])
         for n in result.nodes:
             cex = identify_cex(n.address)
-            w.writerow(
-                [
-                    n.id,
-                    n.out_ref.tx_hash,
-                    n.out_ref.output_index,
-                    n.address,
-                    n.lovelace,
-                    n.ada,
-                    len([a for a in n.assets if not a.is_lovelace]),
-                    n.datum_hash or "",
-                    n.inline_datum is not None,
-                    n.script_ref is not None,
-                    cex is not None,
-                    cex.name if cex else "",
-                ]
-            )
-
+            w.writerow([n.id, n.out_ref.tx_hash, n.out_ref.output_index, n.address,
+                        n.lovelace, n.ada, len([a for a in n.assets if not a.is_lovelace]),
+                        n.datum_hash or "", n.inline_datum is not None,
+                        n.script_ref is not None, cex is not None, cex.name if cex else ""])
     with open(edges_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["id", "source", "target", "direction", "tx_hash", "fee"])
         for e in result.edges:
-            w.writerow(
-                [e.id, e.source, e.target, e.direction, e.tx_hash or "", e.fee or ""]
-            )
-
+            w.writerow([e.id, e.source, e.target, e.direction, e.tx_hash or "", e.fee or ""])
     return nodes_path, edges_path
 
 
@@ -437,126 +396,80 @@ async def _run_trace(
     errors_found = 0
     try:
         if direction == "forward":
-            gen = trace_forward(provider, start, max_depth=max_depth,
-                                cached_nodes=cached_nodes)
+            gen = trace_forward(provider, start, max_depth=max_depth, cached_nodes=cached_nodes)
         else:
             gen = trace_backward(provider, start, max_depth=max_depth,
-                                  cached_nodes=cached_nodes,
-                                  cached_inputs=cached_inputs)
+                                  cached_nodes=cached_nodes, cached_inputs=cached_inputs)
         async for step in gen:
             steps.append(step)
             if step.utxo:
                 nodes_found += 1
-                # Incremental cache: save to in-memory store immediately
                 if store is not None and store_module is not None:
                     store_module.add_node_to_store(step.utxo, store)
                     if step.parent_out_ref:
-                        # Store UTXO input direction: parent[output] → [child(input)]
                         store_module.add_input_to_store(
-                            step.parent_out_ref.node_id(),  # output (closer to start)
-                            step.out_ref.node_id(),         # input (deeper chain)
-                            store,
+                            step.parent_out_ref.node_id(), step.out_ref.node_id(), store,
                         )
             if step.error:
                 errors_found += 1
-            # Periodic flush: save to disk at step 1 (immediate) + every 5 steps
             if store is not None and store_module is not None:
                 n = len(steps)
                 if n == 1 or (n > 0 and n % 5 == 0):
                     store_module.save_store_file(store)
-            progress.update(
-                task_id,
-                advance=1,
-                description=(
-                    f"[cyan]{direction}[/cyan] "
-                    f"depth={step.depth} nodes={nodes_found} errors={errors_found}"
-                    f" [dim]{getattr(provider, 'current_provider', '') or ''}[/dim]"
-                ),
-            )
+            progress.update(task_id, advance=1,
+                description=f"[cyan]{direction}[/cyan] depth={step.depth} nodes={nodes_found} errors={errors_found} [dim]{getattr(provider, 'current_provider', '') or ''}[/dim]")
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     return steps, err, errors_found
 
 
 async def _do_trace(
-    provider: Provider,
-    start: OutRef,
-    direction: str,
-    max_depth: int,
+    provider: Provider, start: OutRef, direction: str, max_depth: int,
     skip_store: bool = False,
 ) -> TraceResult:
-    # Load store once (1 file read) — keep in memory for incremental updates
     from . import cache as _cache_mod
-
     if not skip_store and _cache_mod.STORE_FILE.exists():
         store = _cache_mod.load_store_file()
         _cached_nodes, _cached_inputs = _cache_mod._store_to_models(store)
     else:
         store = None
         _cached_nodes, _cached_inputs = {}, {}
-
     with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed} steps"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=False,
+        SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
+        TextColumn("{task.completed} steps"), TimeElapsedColumn(),
+        console=console, transient=False,
     ) as progress:
         all_steps: list[TraceStep] = []
         err: Optional[str] = None
-
         if direction in ("backward", "both"):
             pname = getattr(provider, "current_provider", "") or ""
-            task = progress.add_task(
-                f"[cyan]backward[/cyan] tracing... [dim]{pname}[/dim]", total=None
-            )
+            task = progress.add_task(f"[cyan]backward[/cyan] tracing... [dim]{pname}[/dim]", total=None)
             bsteps, berr, berrors = await _run_trace(
                 provider, start, "backward", max_depth, progress, task,
-                cached_nodes=_cached_nodes,
-                cached_inputs=_cached_inputs,
-                store=store,
-                store_module=_cache_mod,
+                cached_nodes=_cached_nodes, cached_inputs=_cached_inputs,
+                store=store, store_module=_cache_mod,
             )
             all_steps.extend(bsteps)
             err = berr
-            # Flush store to disk after backward trace completes
             if store is not None:
                 _cache_mod.save_store_file(store)
-
         if direction in ("forward", "both"):
             pname = getattr(provider, "current_provider", "") or ""
-            task = progress.add_task(
-                f"[cyan]forward[/cyan] tracing... [dim]{pname}[/dim]", total=None
-            )
+            task = progress.add_task(f"[cyan]forward[/cyan] tracing... [dim]{pname}[/dim]", total=None)
             fsteps, ferr, _ferrors = await _run_trace(
                 provider, start, "forward", max_depth, progress, task,
-                cached_nodes=_cached_nodes,
-                store=store,
-                store_module=_cache_mod,
+                cached_nodes=_cached_nodes, store=store, store_module=_cache_mod,
             )
             all_steps.extend(fsteps)
             if ferr:
                 err = (err + "; " if err else "") + ferr
-            # Flush store after forward trace too
             if store is not None:
                 _cache_mod.save_store_file(store)
-
     primary_direction = "backward" if direction != "forward" else "forward"
     nodes, edges, traced_path = build_graph_from_steps(all_steps, primary_direction)
-
-    # Set provider name for display
     pname = getattr(provider, "current_provider", "") or ""
-    provider_name = (
-        pname
-        if pname
-        else getattr(provider, "provider_type", "fallback")
-    )
-
-    # If 'both', overlay forward edges
+    provider_name = pname if pname else getattr(provider, "provider_type", "fallback")
     if direction == "both":
-        # rebuild forward separately to also include forward edges
         fwd_steps = [s for s in all_steps if s.direction == "forward"]
         _, fwd_edges, _ = build_graph_from_steps(fwd_steps, "forward")
         existing = {e.id for e in edges}
@@ -564,84 +477,40 @@ async def _do_trace(
             if fe.id not in existing:
                 edges.append(fe)
                 existing.add(fe.id)
-
     cex_findings: list[dict] = []
     for n in nodes:
         cex = identify_cex(n.address)
         if cex:
-            cex_findings.append(
-                {
-                    "node_id": n.id,
-                    "address": n.address,
-                    "name": cex.name,
-                    "type": cex.type,
-                    "confidence": cex.confidence,
-                    "ada": round(n.ada, 6),
-                }
-            )
-
+            cex_findings.append({
+                "node_id": n.id, "address": n.address, "name": cex.name,
+                "type": cex.type, "confidence": cex.confidence, "ada": round(n.ada, 6),
+            })
     return TraceResult(
-        nodes=nodes,
-        edges=edges,
-        traced_path=traced_path,
-        start_out_ref=start,
-        direction=direction,
-        max_depth=max_depth,
-        cex_findings=cex_findings,
-        error=err,
-        steps=all_steps,
-        provider_name=provider_name,
+        nodes=nodes, edges=edges, traced_path=traced_path,
+        start_out_ref=start, direction=direction, max_depth=max_depth,
+        cex_findings=cex_findings, error=err, steps=all_steps, provider_name=provider_name,
     )
-
-
-# --------------- CLI --------------- #
-
 
 _MAIN_HELP = """\
 Cardano UTXO chain tracer — trace funds through Cardano blockchain.
 
-\\b
 PROVIDERS
   blockfrost   Blockfrost API (mainnet/testnet). Backward tracing only.
-               Auth: project_id (default) | bearer | dmtr-api-key (Demeter.run)
   koios        Koios public API. Backward tracing only.
-               Auth: optional API key
   maestro      Maestro API. Backward tracing only.
-               Auth: x-api-key header (required)
-  kupmios      Kupo + Ogmios (local node). Supports BOTH backward AND forward tracing.
-               Auth: separate optional keys per service
+  kupmios      Kupo + Ogmios (local node). Supports both directions.
+  utxorpc      UTxORPC gRPC.
 
-\\b
 FALLBACK
-  By default the tool uses fallback across multiple providers for reliability.
   --fallback (on)   tries primary, then utxorpc -> blockfrost -> koios -> maestro
-  --no-fallback     single provider only (original behavior)
+  --no-fallback     single provider only
 
-\\b
-CONFIG PRIORITY  CLI flags > shell env > .env file (auto-discovered) > config.json
+CONFIG PRIORITY  CLI flags > shell env > .env file > config.json
 
-\\b
 EXAMPLES
-  \\b
-  # Single provider
   utxo-tracer trace abc123...#0 --provider blockfrost --api-key mainnet_XXX
-  \\b
-  # Default: auto-fallback across all configured providers
   utxo-tracer trace abc123...#0
-  \\b
-  # Forward trace (requires kupmios)
-  utxo-tracer trace abc123...#0 --provider kupmios
-    --kupo-url http://localhost:1442 --ogmios-url http://localhost:1337
-    --direction forward --max-depth 10
-  \\b
-  # Demeter.run
-  BLOCKFROST_AUTH_TYPE=dmtr-api-key BLOCKFROST_API_KEY=dmtr_XXX
-  BLOCKFROST_ENDPOINT_URL=https://cardano-mainnet.blockfrost.io/api/v0
-  utxo-tracer trace abc123...#0 --provider blockfrost
-  \b
-  # UTxORPC (high-throughput, self-host or Demeter.run)
-  utxo-tracer trace abc123...#0 --provider utxorpc --api-key YOUR_KEY
-  utxo-tracer trace abc123...#0 --provider utxorpc --base-url https://mainnet.utxorpc.com
+  utxo-tracer trace abc123...#0 --provider kupmios --direction forward
 """
 
 
@@ -651,78 +520,18 @@ def main() -> None:
     pass
 
 
-@main.command(
-    "trace",
-    help="""\
-Trace a UTXO backwards/forwards through the chain.
-
-|\\\\b
-UTXO format: <tx_hash>#<output_index>
-  e.g. abc123def456...#0
-
-\\\\b
-PROVIDER OPTIONS
-  --provider       blockfrost | koios | maestro | kupmios | utxorpc
-  --api-key        API key (blockfrost project_id / koios / maestro / utxorpc)
-  --auth-type      Blockfrost only: project_id (default) | bearer | dmtr-api-key
-  --endpoint-url   Blockfrost/Demeter: upstream endpoint override
-  --base-url       Override provider base URL directly
-  --kupo-url       Kupmios: Kupo base URL  (e.g. http://localhost:1442)
-  --ogmios-url     Kupmios: Ogmios base URL (e.g. http://localhost:1337)
-  --use-proxy      Route through local proxy at --proxy-url [default: off]
-  --proxy-url      Proxy base URL [default: http://localhost:3001]
-
-\\\\b
-FALLBACK
-  By default the tool uses fallback across multiple providers for reliability.
-  --fallback (on)   tries primary, then utxorpc -> blockfrost -> koios -> maestro
-  --no-fallback     single provider only (original behavior)
-
-\\b
-TRACE OPTIONS
-  --direction      backward | forward | both  [default: backward]
-                   forward requires --provider kupmios
-  --max-depth      Max recursion depth         [default: 5]
-
-\\b
-OUTPUT OPTIONS
-  --output         table | json | csv          [default: table]
-  --export-json    Save full trace result to JSON file
-  --export-csv     Save nodes + edges as CSV files (prefix path)
-  --depth-report   Show node count per depth level
-
-\b
-CEX DETECTION
-  --cex-file       JSON file with exchange address registry
-""",
-)
+@main.command("trace", help="Trace a UTXO backwards/forwards through the chain.")
 @click.argument("utxo", type=str)
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
+@click.option("--provider", type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]), default=None)
 @click.option("--api-key", type=str, default=None)
 @click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
+@click.option("--auth-type", type=click.Choice(["project_id", "bearer", "dmtr-api-key"]), default=None)
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
 @click.option("--ogmios-url", type=str, default=None)
-@click.option(
-    "--direction",
-    type=click.Choice(["backward", "forward", "both"]),
-    default=None,
-)
+@click.option("--direction", type=click.Choice(["backward", "forward", "both"]), default=None)
 @click.option("--max-depth", type=int, default=None)
-@click.option(
-    "--output",
-    type=click.Choice(["table", "json", "csv"]),
-    default="table",
-)
+@click.option("--output", type=click.Choice(["table", "json", "csv"]), default="table")
 @click.option("--export-json", type=click.Path(dir_okay=False), default=None)
 @click.option("--export-csv", type=click.Path(), default=None)
 @click.option("--fallback/--no-fallback", default=True)
@@ -731,60 +540,31 @@ CEX DETECTION
 @click.option("--dash/--no-dash", default=True, hidden=True)
 @click.option("--use-proxy/--no-proxy", default=False)
 @click.option("--proxy-url", type=str, default="http://localhost:3001")
-@click.option("--no-cache", is_flag=True, default=False,
-              help="Skip local cache; always query providers.")
-def trace_cmd(
-    utxo: str,
-    provider: Optional[str],
-    api_key: Optional[str],
-    base_url: Optional[str],
-    auth_type: Optional[str],
-    endpoint_url: Optional[str],
-    kupo_url: Optional[str],
-    ogmios_url: Optional[str],
-    direction: Optional[str],
-    max_depth: Optional[int],
-    output: str,
-    export_json: Optional[str],
-    export_csv: Optional[str],
-    dash: bool,
-    fallback: bool,
-    cex_file: Optional[str],
-    depth_report: bool,
-    use_proxy: bool,
-    proxy_url: str,
-    no_cache: bool,
-) -> None:
+@click.option("--no-cache", is_flag=True, default=False, help="Skip local cache; always query providers.")
+def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
+              kupo_url, ogmios_url, direction, max_depth, output,
+              export_json, export_csv, fallback, cex_file, depth_report,
+              dash, use_proxy, proxy_url, no_cache):
     cfg = load_config()
     defaults = cfg.get("defaults", {}) or {}
     direction = direction or defaults.get("direction") or "backward"
-    max_depth = (
-        max_depth if max_depth is not None else int(defaults.get("max_depth") or 5)
-    )
-
-
-    # Note: env vars inherited at process start (may include shell overrides of .env)
+    max_depth = max_depth if max_depth is not None else int(defaults.get("max_depth") or 5)
     for _var in ["UTXO_TRACER_PROVIDER", "UTXORPC_ENDPOINT_URL"]:
         if _var in os.environ:
             logger.info("Env %s=%s", _var, os.environ[_var][:30])
-
     if cex_file:
         try:
             count = load_cex_from_file(cex_file)
             console.print(f"[green]Loaded {count} CEX entries from {cex_file}[/green]")
         except Exception as e:
             err_console.print(f"[yellow]Warning loading CEX file:[/yellow] {e}")
-
     try:
         start = parse_out_ref(utxo)
     except ValueError as e:
         _fatal(str(e))
-
-    # ── check cache ────────────────────────────────────────────────
     if not no_cache:
         cached_result = cache_mod.load_trace(start, direction, max_depth)
         if cached_result is not None:
-            # Check if cached result had errors — if so, re-trace
             if getattr(cached_result, "errors_count", 0) > 0:
                 console.print("[yellow]Cached trace had errors — re-tracing missing UTXOs[/yellow]")
             else:
@@ -793,25 +573,14 @@ def trace_cmd(
                 ck = cache_mod._cache_key(start, direction, max_depth)
                 start_server(cached_result, start_out_ref=start, cache_key=ck)
                 return
-    # ────────────────────────────────────────────────────────────────
-
     provider_name = _resolve_provider_name(provider, cfg)
-
-    if direction in ("forward", "both") and provider_name != "kupmios":
-        _fatal(f"Forward tracing requires --provider kupmios (got '{provider_name}').")
-
+    if direction in ("forward", "both") and provider_name not in ("kupmios", "blockfrost", "koios"):
+        _fatal(f"Forward tracing requires --provider kupmios, blockfrost, or koios (got '{provider_name}').")
     prov = _build_providers(
-        provider_name,
-        cfg,
-        use_fallback=fallback,
-        api_key=api_key,
-        base_url=base_url,
-        auth_type=auth_type,
-        endpoint_url=endpoint_url,
-        kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
-        use_proxy=use_proxy,
-        proxy_url=proxy_url,
+        provider_name, cfg, use_fallback=fallback,
+        api_key=api_key, base_url=base_url, auth_type=auth_type,
+        endpoint_url=endpoint_url, kupo_url=kupo_url, ogmios_url=ogmios_url,
+        use_proxy=use_proxy, proxy_url=proxy_url,
     )
 
     async def _runner() -> TraceResult:
@@ -820,20 +589,15 @@ def trace_cmd(
 
     try:
         result = asyncio.run(_runner())
-        # Save to cache for future per-step acceleration (skip when --no-cache)
         if not no_cache:
-            cache_mod.save_trace(result, start, direction, max_depth,
-                                 provider=provider_name)
+            cache_mod.save_trace(result, start, direction, max_depth, provider=provider_name)
     except RuntimeError as e:
         if "event loop" in str(e).lower():
-            _fatal(
-                "Cannot run: already inside an event loop (Jupyter/pytest-asyncio). Use `await` instead."
-            )
+            _fatal("Cannot run: already inside an event loop (Jupyter/pytest-asyncio). Use `await` instead.")
         raise
     except KeyboardInterrupt:
         err_console.print("[yellow]Trace interrupted[/yellow]")
         sys.exit(130)
-
     if output == "json":
         click.echo(jsonlib.dumps(_dataclass_to_dict(result), indent=2, default=str))
     elif output == "csv":
@@ -845,30 +609,23 @@ def trace_cmd(
         _print_nodes_table(result)
         _print_cex_findings(result)
         _print_depth_tree(result, result.steps)
-
     if depth_report:
         _print_depth_report(result.steps)
-
     if export_json and output != "json":
         _export_json(result, export_json)
         console.print(f"[green]Exported JSON:[/green] {export_json}")
-
     if export_csv and output != "csv":
         n_path, e_path = _export_csv(result, export_csv)
         console.print(f"[green]Exported nodes CSV:[/green] {n_path}")
         console.print(f"[green]Exported edges CSV:[/green] {e_path}")
-
-    # Always start Dash Cytoscape after trace
     from .graph.dash_app import start_server
-
     if dash:
         console.print("[green]Starting Dash Cytoscape graph...[/green]")
         Timer(1.5, _open_browser).start()
         ck = cache_mod._cache_key(start, direction, max_depth) if not no_cache else ""
-        start_server(result, start_out_ref=start, cache_key=ck)
+        start_server(result, start_out_ref=start, cache_key=ck, cashflow_summary=None)
     else:
         console.print("[green]Trace complete. Use --dash to open interactive graph.[/green]")
-
     if result.error:
         err_console.print(f"[red]Trace ended with error:[/red] {result.error}")
         sys.exit(2)
@@ -880,46 +637,23 @@ def config_group() -> None:
 
 
 @config_group.command("set")
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    required=True,
-)
+@click.option("--provider", type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]), required=True)
 @click.option("--api-key", type=str, default=None)
 @click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
+@click.option("--auth-type", type=click.Choice(["project_id", "bearer", "dmtr-api-key"]), default=None)
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
 @click.option("--ogmios-url", type=str, default=None)
 @click.option("--kupo-api-key", type=str, default=None)
 @click.option("--ogmios-api-key", type=str, default=None)
 @click.option("--make-default/--no-default", default=True)
-def config_set(
-    provider: str,
-    api_key: Optional[str],
-    base_url: Optional[str],
-    auth_type: Optional[str],
-    endpoint_url: Optional[str],
-    kupo_url: Optional[str],
-    ogmios_url: Optional[str],
-    kupo_api_key: Optional[str],
-    ogmios_api_key: Optional[str],
-    make_default: bool,
-) -> None:
+def config_set(provider, api_key, base_url, auth_type, endpoint_url,
+               kupo_url, ogmios_url, kupo_api_key, ogmios_api_key, make_default):
     cfg = set_provider_config(
-        provider=provider,
-        api_key=api_key,
-        base_url=base_url,
-        auth_type=auth_type,
-        endpoint_url=endpoint_url,
-        kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
-        kupo_api_key=kupo_api_key,
-        ogmios_api_key=ogmios_api_key,
+        provider=provider, api_key=api_key, base_url=base_url,
+        auth_type=auth_type, endpoint_url=endpoint_url,
+        kupo_url=kupo_url, ogmios_url=ogmios_url,
+        kupo_api_key=kupo_api_key, ogmios_api_key=ogmios_api_key,
         make_default=make_default,
     )
     console.print(f"[green]Saved config for provider '{provider}'.[/green]")
@@ -929,7 +663,6 @@ def config_set(
 @config_group.command("show")
 def config_show() -> None:
     cfg = load_config()
-
     def _redact(d: dict) -> dict:
         out = {}
         for k, v in d.items():
@@ -940,7 +673,6 @@ def config_show() -> None:
             else:
                 out[k] = v
         return out
-
     console.print(jsonlib.dumps(_redact(cfg), indent=2))
 
 
@@ -953,56 +685,29 @@ def config_clear() -> None:
 
 
 @main.command("health", help="Check provider connectivity.")
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
+@click.option("--provider", type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]), default=None)
 @click.option("--api-key", type=str, default=None)
 @click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
+@click.option("--auth-type", type=click.Choice(["project_id", "bearer", "dmtr-api-key"]), default=None)
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
 @click.option("--ogmios-url", type=str, default=None)
 @click.option("--fallback/--no-fallback", default=True)
 @click.option("--use-proxy/--no-proxy", default=False)
 @click.option("--proxy-url", type=str, default="http://localhost:3001")
-def health_cmd(
-    provider: Optional[str],
-    api_key: Optional[str],
-    base_url: Optional[str],
-    auth_type: Optional[str],
-    endpoint_url: Optional[str],
-    kupo_url: Optional[str],
-    ogmios_url: Optional[str],
-    fallback: bool,
-    use_proxy: bool,
-    proxy_url: str,
-) -> None:
+def health_cmd(provider, api_key, base_url, auth_type, endpoint_url,
+               kupo_url, ogmios_url, fallback, use_proxy, proxy_url):
     cfg = load_config()
     provider_name = _resolve_provider_name(provider, cfg)
     prov = _build_providers(
-        provider_name,
-        cfg,
-        use_fallback=fallback,
-        api_key=api_key,
-        base_url=base_url,
-        auth_type=auth_type,
-        endpoint_url=endpoint_url,
-        kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
-        use_proxy=use_proxy,
-        proxy_url=proxy_url,
+        provider_name, cfg, use_fallback=fallback,
+        api_key=api_key, base_url=base_url, auth_type=auth_type,
+        endpoint_url=endpoint_url, kupo_url=kupo_url, ogmios_url=ogmios_url,
+        use_proxy=use_proxy, proxy_url=proxy_url,
     )
-
     async def _check() -> bool:
         async with prov as p:
             return await p.health_check()
-
     ok = asyncio.run(_check())
     if ok:
         console.print("[green]OK[/green] provider chain is reachable.")
@@ -1013,35 +718,17 @@ def health_cmd(
 
 @main.command("assets", help="Show asset breakdown for a single UTXO.")
 @click.argument("utxo", type=str)
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
+@click.option("--provider", type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]), default=None)
 @click.option("--api-key", type=str, default=None)
 @click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
+@click.option("--auth-type", type=click.Choice(["project_id", "bearer", "dmtr-api-key"]), default=None)
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
 @click.option("--ogmios-url", type=str, default=None)
 @click.option("--use-proxy/--no-proxy", default=False)
 @click.option("--proxy-url", type=str, default="http://localhost:3001")
-def assets_cmd(
-    utxo: str,
-    provider: Optional[str],
-    api_key: Optional[str],
-    base_url: Optional[str],
-    auth_type: Optional[str],
-    endpoint_url: Optional[str],
-    kupo_url: Optional[str],
-    ogmios_url: Optional[str],
-    use_proxy: bool,
-    proxy_url: str,
-) -> None:
+def assets_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
+               kupo_url, ogmios_url, use_proxy, proxy_url):
     cfg = load_config()
     try:
         out_ref = parse_out_ref(utxo)
@@ -1049,64 +736,37 @@ def assets_cmd(
         _fatal(str(e))
     provider_name = _resolve_provider_name(provider, cfg)
     provider_cfg = (cfg.get("providers") or {}).get(provider_name, {}) or {}
-    overrides = {
-        "api_key": api_key,
-        "base_url": base_url,
-        "auth_type": auth_type,
-        "endpoint_url": endpoint_url,
-        "kupo_url": kupo_url,
-        "ogmios_url": ogmios_url,
-    }
-    overrides = {k: v for k, v in overrides.items() if v is not None}
-    prov = build_provider(
-        provider_name,
-        provider_cfg,
-        use_proxy=use_proxy,
-        proxy_url=proxy_url,
-        overrides=overrides,
-    )
-
+    overrides = {k: v for k, v in {
+        "api_key": api_key, "base_url": base_url, "auth_type": auth_type,
+        "endpoint_url": endpoint_url, "kupo_url": kupo_url, "ogmios_url": ogmios_url,
+    }.items() if v is not None}
+    prov = build_provider(provider_name, provider_cfg, use_proxy=use_proxy,
+                           proxy_url=proxy_url, overrides=overrides)
     async def _fetch():
         async with prov as p:
             return await p.get_utxo_by_out_ref(out_ref)
-
     node = asyncio.run(_fetch())
     if not node:
         _fatal(f"UTXO not found: {out_ref}")
-
-    panel = Panel.fit(
-        "\n".join(
-            [
-                f"[bold]UTXO:[/bold] {node.out_ref}",
-                f"[bold]Address:[/bold] {node.address}",
-                f"[bold]Lovelace:[/bold] {node.lovelace:,}",
-                f"[bold]ADA:[/bold] {lovelace_to_ada(node.lovelace)}",
-                f"[bold]Datum hash:[/bold] {node.datum_hash or '-'}",
-                f"[bold]Inline datum:[/bold] {'yes' if node.inline_datum else 'no'}",
-                f"[bold]Script ref:[/bold] {node.script_ref or '-'}",
-            ]
-        ),
-        title="UTXO",
-        border_style="cyan",
-    )
-    console.print(panel)
-
+    console.print(Panel.fit("\n".join([
+        f"[bold]UTXO:[/bold] {node.out_ref}",
+        f"[bold]Address:[/bold] {node.address}",
+        f"[bold]Lovelace:[/bold] {node.lovelace:,}",
+        f"[bold]ADA:[/bold] {lovelace_to_ada(node.lovelace)}",
+        f"[bold]Datum hash:[/bold] {node.datum_hash or '-'}",
+        f"[bold]Inline datum:[/bold] {'yes' if node.inline_datum else 'no'}",
+        f"[bold]Script ref:[/bold] {node.script_ref or '-'}",
+    ]), title="UTXO", border_style="cyan"))
     table = Table(title="Assets", header_style="bold magenta")
     table.add_column("Policy ID", overflow="fold")
     table.add_column("Asset Name")
     table.add_column("Unit", overflow="fold")
     table.add_column("Quantity", justify="right")
     for a in node.assets:
-        table.add_row(
-            a.policy_id or "(lovelace)",
-            a.asset_name or "-",
-            a.unit,
-            f"{a.quantity:,}",
-        )
+        table.add_row(a.policy_id or "(lovelace)", a.asset_name or "-", a.unit, f"{a.quantity:,}")
     console.print(table)
 
-
-# ── cache commands ──────────────────────────────────────────────
+# cache commands
 
 @main.group("cache", help="Manage local trace cache.")
 def cache_group() -> None:
@@ -1115,11 +775,9 @@ def cache_group() -> None:
 
 @cache_group.command("list", help="List cached traces.")
 def cache_list() -> None:
-    from rich.table import Table
     entries = cache_mod.list_traces()
     if not entries:
-        console = Console()
-        console.print("[yellow]No cached traces.[/yellow]")
+        Console().print("[yellow]No cached traces.[/yellow]")
         return
     table = Table(title=f"Cached Traces ({len(entries)})")
     table.add_column("Key", style="cyan")
@@ -1131,16 +789,10 @@ def cache_list() -> None:
     table.add_column("Provider")
     table.add_column("Exists")
     for e in entries:
-        table.add_row(
-            e.get("start", "?")[:18],
-            e.get("start", "")[:24],
-            str(e.get("direction", "?")),
-            str(e.get("max_depth", "?")),
-            str(e.get("nodes", "?")),
-            str(e.get("total_ada", "?")),
-            str(e.get("provider", "?")),
-            "✓" if e.get("exists") else "✗",
-        )
+        table.add_row(e.get("start", "?")[:18], e.get("start", "")[:24],
+                      str(e.get("direction", "?")), str(e.get("max_depth", "?")),
+                      str(e.get("nodes", "?")), str(e.get("total_ada", "?")),
+                      str(e.get("provider", "?")), "\u2713" if e.get("exists") else "\u2717")
     Console().print(table)
 
 
@@ -1152,7 +804,6 @@ def cache_clear() -> None:
 
 @cache_group.command("info", help="Show cache storage info.")
 def cache_info() -> None:
-    from rich.table import Table
     from pathlib import Path
     cache_dir = cache_mod.CACHE_DIR
     size = 0
@@ -1167,19 +818,16 @@ def cache_info() -> None:
     table.add_column("Value")
     table.add_row("Cache dir", str(cache_dir))
     table.add_row("Trace files", str(len(list(cache_dir.glob("traces/*.json")))))
-    table.add_row("Store nodes", str(summary["nodes"]) + (" ✓" if store_ok else " (no store)"))
+    table.add_row("Store nodes", str(summary["nodes"]) + (" \u2713" if store_ok else " (no store)"))
     table.add_row("Store tx inputs", str(summary["inputs"]))
     table.add_row("Store transactions", str(summary["transactions"]))
     table.add_row("Size", f"{size/1024:.1f} KB")
     Console().print(table)
 
 
-# ── open from cache ─────────────────────────────────────────────
-
 @main.command("open", help="Open cached trace visualization.")
 @click.argument("cache_key")
 def open_cmd(cache_key: str) -> None:
-    """Load a cached trace by its cache key and open the Dash visualizer."""
     from .graph.dash_app import start_server
     trace_file = cache_mod.TRACES_DIR / f"{cache_key}.json"
     if not trace_file.exists():
@@ -1195,13 +843,618 @@ def open_cmd(cache_key: str) -> None:
         start_ref = OutRef(tx_hash, int(idx_s))
     else:
         start_ref = OutRef(start_str, 0)
-    result = cache_mod.load_trace(
-        start_ref, meta.get("direction", "backward"), meta.get("max_depth", 0)
-    )
+    result = cache_mod.load_trace(start_ref, meta.get("direction", "backward"), meta.get("max_depth", 0))
     if result is None:
         Console().print("[red]Failed to parse cached trace data.[/red]")
         return
     start_server(result, start_out_ref=start_ref, cache_key=cache_key)
+
+
+# CEX cashflow commands
+
+@main.group("cex", help="CEX address detection and cashflow reconciliation.")
+def cex_group() -> None:
+    pass
+
+
+@cex_group.command("cashflow", help="""Reconcile CEX deposit/withdrawal records around a specific UTXO's time.
+
+The time window is auto-calculated from the UTXO's block time ± window hours.
+This is more precise than a broad time range — it focuses on the exact moment
+the on-chain transaction occurred.
+
+Credentials loaded from env vars by default (BINANCE_API_KEY, etc.).
+Override with --api-key / --api-secret flags.
+
+Examples:
+  # Uses BINANCE_API_KEY env var, resolves UTXO time, ±24h window
+  utxo-tracer cex cashflow binance abc123...#0 --provider blockfrost --bf-api-key xxx
+
+  # Custom window
+  utxo-tracer cex cashflow binance abc123...#0 --window 48 --provider blockfrost --bf-api-key xxx
+
+  # Export CSV
+  utxo-tracer cex cashflow binance abc123...#0 --csv report.csv --provider blockfrost --bf-api-key xxx
+""")
+@click.argument("exchange", type=str)
+@click.argument("utxo", type=str)
+@click.option("--api-key", type=str, default=None, help="Override API key (default: from env)")
+@click.option("--api-secret", type=str, default=None, help="Override API secret (default: from env)")
+@click.option("--api-passphrase", type=str, default=None, help="Override API passphrase (KuCoin/OKX)")
+@click.option("--window", type=int, default=24, help="Hours before+after UTXO time to search CEX records (default: 24)")
+@click.option("--currency", type=str, default="ADA")
+@click.option("--base-url", type=str, default=None)
+@click.option("--output", type=click.Choice(["table", "json", "summary"]), default="table")
+@click.option("--csv", type=str, default=None, help="Export results to CSV file")
+@click.option("--provider", type=str, required=True, help="Cardano provider to resolve UTXO time (blockfrost/koios)")
+@click.option("--bf-api-key", type=str, default=None)
+@click.option("--consolidation/--no-consolidation", default=False, help="Detect CEX consolidation patterns")
+def cashflow_cmd(exchange, utxo, api_key, api_secret, api_passphrase,
+                 window, currency, base_url, output, csv,
+                 provider, bf_api_key, consolidation):
+    from .cex.api import build_cex_client
+    from .cex.flow import CashflowReconciler, resolve_utxo_time, format_time_window
+    from .config import load_config
+
+    cfg = load_config()
+
+    # Build on-chain provider to resolve UTXO time
+    prov_name = _resolve_provider_name(provider, cfg)
+    prov_cfg = (cfg.get("providers") or {}).get(prov_name, {}) or {}
+    if bf_api_key or prov_cfg.get("api_key"):
+        from .providers import build_provider
+        onchain_provider = build_provider(
+            prov_name, prov_cfg,
+            overrides={"api_key": bf_api_key} if bf_api_key else {},
+        )
+    else:
+        console.print("[red]Need --provider and --bf-api-key to resolve UTXO time.[/red]")
+        sys.exit(1)
+
+    async def _run():
+        # 1. Resolve UTXO → block time
+        console.print(f"[cyan]Resolving time for UTXO {utxo}...[/cyan]")
+        block_time, out_ref = await resolve_utxo_time(onchain_provider, utxo)
+        start_ts, end_ts = format_time_window(block_time, window, window)
+        console.print(f"  Block time: {block_time} ({_fmt_ts(block_time)})")
+        console.print(f"  Window: {window}h before → {window}h after")
+        console.print(f"  CEX query range: {start_ts} → {end_ts}")
+
+        # 2. Reconcile CEX records in that window
+        from .cex.matching.consolidation import detect_consolidations
+        from .cex.matching.registry_populate import auto_register_from_matches
+
+        async with CashflowReconciler(onchain_provider=onchain_provider) as reconciler:
+            kwargs = {"api_key": api_key, "api_secret": api_secret}
+            if api_passphrase:
+                kwargs["api_passphrase"] = api_passphrase
+            if base_url:
+                kwargs["base_url"] = base_url
+            summary = await reconciler.reconcile(
+                exchange=exchange, start_time=start_ts, end_time=end_ts,
+                currency=currency, **kwargs,
+            )
+
+            auto_reg_count = auto_register_from_matches(summary.matches)
+            if auto_reg_count > 0:
+                logger.info("Auto-registered %d CEX addresses", auto_reg_count)
+
+            consolidation_patterns = []
+            if consolidation and summary.unmatched_onchain_records:
+                from .cex.registry import get_all_cex_addresses
+                known_addrs = set(get_all_cex_addresses().keys())
+                consolidation_patterns = detect_consolidations(
+                    summary.unmatched_onchain_records, known_addrs
+                )
+
+            if output == "json":
+                from dataclasses import asdict
+                import json
+                payload = asdict(summary)
+                payload["block_time"] = block_time
+                payload["utxo"] = utxo
+                payload["consolidation_patterns"] = [
+                    {"tx_hash": c.tx_hash, "input_count": c.input_count,
+                     "total_input_ada": c.total_input_ada, "hot_wallet_address": c.hot_wallet_address}
+                    for c in consolidation_patterns
+                ]
+                click.echo(json.dumps(payload, default=str, indent=2))
+            elif output == "summary":
+                console.print(reconciler.format_summary(summary))
+            else:
+                console.print(reconciler.format_summary(summary))
+                _print_cashflow_matches_table(summary)
+
+            if csv:
+                _export_cashflow_csv(summary, csv)
+
+            if consolidation_patterns:
+                _print_consolidation_report(consolidation_patterns, exchange)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Cancelled[/yellow]")
+        sys.exit(130)
+    finally:
+        if onchain_provider is not None:
+            asyncio.run(onchain_provider.aclose())
+
+
+def _print_cashflow_matches_table(summary) -> None:
+    if not summary.matches:
+        return
+    table = Table(title=f"Cashflow Matches ({len(summary.matches)})", header_style="bold green")
+    table.add_column("Type")
+    table.add_column("Amount")
+    table.add_column("CEX Address", overflow="fold")
+    table.add_column("Confidence")
+    table.add_column("Match")
+    table.add_column("On-Chain Addr", overflow="fold")
+    for m in summary.matches:
+        type_str = "[bold yellow]DEPOSIT[/bold yellow]" if m.cex_record.is_deposit else "[bold cyan]WITHDRAW[/bold cyan]"
+        amount_str = f"{m.cex_record.amount:.2f} ADA"
+        addr = m.cex_record.address[:16] + "\u2026" if len(m.cex_record.address) > 16 else m.cex_record.address
+        mtype_str = {"txid": "[green]txid[/green]"}.get(m.match_type, f"[dim]{m.match_type}[/dim]")
+        onchain_addrs = ", ".join(oc.address[:16] + "\u2026" if len(oc.address) > 16 else oc.address
+                                  for oc in m.onchain_records[:2])
+        if len(m.onchain_records) > 2:
+            onchain_addrs += f" [+{len(m.onchain_records)-2}]"
+        table.add_row(type_str, amount_str, addr, f"{m.confidence*100:.0f}%", mtype_str, onchain_addrs)
+    console.print(table)
+    if summary.unmatched_cex_records:
+        utable = Table(title=f"Unmatched CEX Records ({len(summary.unmatched_cex_records)})", header_style="bold red")
+        utable.add_column("Type")
+        utable.add_column("Amount")
+        utable.add_column("Address", overflow="fold")
+        utable.add_column("Has TXID")
+        utable.add_column("Timestamp")
+        for r in summary.unmatched_cex_records[:15]:
+            utable.add_row(
+                "[yellow]DEPOSIT[/yellow]" if r.is_deposit else "[cyan]WITHDRAW[/cyan]",
+                f"{r.amount:.2f} ADA",
+                r.address[:16] + "\u2026" if len(r.address) > 16 else r.address,
+                "[green]yes[/green]" if r.has_txid else "[red]no[/red]",
+                str(r.timestamp),
+            )
+        if len(summary.unmatched_cex_records) > 15:
+            utable.add_row(f"[dim]\u2026 {len(summary.unmatched_cex_records)-15} more[/dim]", "", "", "", "")
+        console.print(utable)
+
+
+def _export_cashflow_csv(summary, path: str) -> None:
+    """Export cashflow matches to CSV file."""
+    import csv
+    from pathlib import Path
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["type", "amount", "cex_address", "cex_txid", "confidence",
+                     "match_type", "onchain_tx_hash", "onchain_address", "onchain_amount"])
+        for m in summary.matches:
+            for oc in m.onchain_records:
+                w.writerow([
+                    m.cex_record.tx_type,
+                    m.cex_record.amount,
+                    m.cex_record.address,
+                    m.cex_record.txid or "",
+                    f"{m.confidence:.4f}",
+                    m.match_type,
+                    oc.tx_hash,
+                    oc.address,
+                    oc.amount_ada,
+                ])
+
+    console.print(f"[green]Wrote cashflow CSV:[/green] {p}")
+
+
+def _print_consolidation_report(patterns, exchange: str) -> None:
+    """Print CEX consolidation patterns as a Rich table."""
+    if not patterns:
+        return
+
+    from rich.table import Table
+
+    table = Table(
+        title=f"CEX Consolidation Patterns ({len(patterns)}) — {exchange.upper()}",
+        header_style="bold magenta",
+    )
+    table.add_column("TX Hash", overflow="fold")
+    table.add_column("Inputs")
+    table.add_column("Total ADA", justify="right")
+    table.add_column("Hot Wallet", overflow="fold")
+
+    for c in patterns[:10]:
+        table.add_row(
+            c.tx_hash[:20] + "\u2026" if len(c.tx_hash) > 20 else c.tx_hash,
+            str(c.input_count),
+            f"{c.total_input_ada:,.2f}",
+            c.hot_wallet_address[:16] + "\u2026" if len(c.hot_wallet_address) > 16 else c.hot_wallet_address,
+        )
+
+    if len(patterns) > 10:
+        table.add_row(f"[dim]\u2026 {len(patterns) - 10} more[/dim]", "", "", "")
+
+    console.print(table)
+
+
+@cex_group.command("env", help="Show available CEX env var names and check which are set.")
+def cex_env_cmd():
+    """Show available CEX configuration via environment variables."""
+    import os
+
+    env_vars = {
+        "BINANCE_API_KEY": "Binance API key",
+        "BINANCE_API_SECRET": "Binance API secret",
+        "BYBIT_API_KEY": "Bybit API key",
+        "BYBIT_API_SECRET": "Bybit API secret",
+        "KUCOIN_API_KEY": "KuCoin API key",
+        "KUCOIN_API_SECRET": "KuCoin API secret",
+        "KUCOIN_API_PASSPHRASE": "KuCoin API passphrase",
+        "OKX_API_KEY": "OKX API key",
+        "OKX_API_SECRET": "OKX API secret",
+        "OKX_API_PASSPHRASE": "OKX API passphrase",
+    }
+
+    table = Table(title="CEX Environment Variables", header_style="bold cyan")
+    table.add_column("Env Var")
+    table.add_column("Description")
+    table.add_column("Status")
+
+    for var, desc in sorted(env_vars.items()):
+        val = os.environ.get(var)
+        if val:
+            redacted = val[:4] + "****" if len(val) > 6 else "****"
+            status = f"[green]set[/green] ({redacted})"
+        else:
+            status = "[dim]not set[/dim]"
+        table.add_row(var, desc, status)
+
+    console.print(table)
+    console.print()
+    console.print("Add to [yellow]~/.utxo-tracer/.env[/yellow] or export in shell:")
+    console.print("  [dim]# Example:[/dim]")
+    console.print("  [green]BINANCE_API_KEY[/green]=your_api_key")
+    console.print("  [green]BINANCE_API_SECRET[/green]=your_api_secret")
+    console.print("  [green]KUCOIN_API_KEY[/green]=your_kucoin_key")
+    console.print("  [green]KUCOIN_API_PASSPHRASE[/green]=your_passphrase")
+
+
+# ── CEX import/report/cache subcommands ─────────────────────
+
+
+@cex_group.command("import", help="Import CEX records from CSV/JSON for offline reconciliation.")
+@click.argument("file", type=click.Path(exists=True))
+@click.option("--exchange", type=str, default=None,
+              help="Override exchange name (auto-detected if in file)")
+@click.option("--start-ts", type=int, default=None,
+              help="Filter: start time (Unix epoch)")
+@click.option("--end-ts", type=int, default=None,
+              help="Filter: end time (Unix epoch)")
+@click.option("--output", type=click.Choice(["table", "summary"]), default="table")
+@click.option("--onchain", is_flag=True, default=False,
+              help="Attempt on-chain cross-reference (requires Blockfrost)")
+@click.option("--bf-api-key", type=str, default=None,
+              help="Blockfrost API key for on-chain queries")
+def cex_import_cmd(file, exchange, start_ts, end_ts, output, onchain, bf_api_key):
+    """Import CEX records from CSV/JSON and run reconciliation."""
+    from .cex.flow import import_from_csv, import_from_json, CashflowReconciler
+
+    path = str(file)
+    if path.endswith(".json"):
+        records = import_from_json(path, exchange)
+    else:
+        records = import_from_csv(path, exchange)
+
+    if not records:
+        console.print("[yellow]No records found in file.[/yellow]")
+        return
+
+    # Filter by time range
+    if start_ts is not None:
+        records = [r for r in records if r.timestamp >= start_ts]
+    if end_ts is not None:
+        records = [r for r in records if r.timestamp <= end_ts]
+
+    console.print(f"[green]Loaded {len(records)} records from {path}[/green]")
+
+    # On-chain provider
+    onchain_provider = None
+    if onchain and bf_api_key:
+        from .providers import build_provider
+        onchain_provider = build_provider("blockfrost",
+                                          {"api_key": bf_api_key, "auth_type": "project_id"})
+
+    async def _run():
+        async with CashflowReconciler(onchain_provider=onchain_provider) as reconciler:
+            summary = await reconciler.reconcile_with_records(
+                exchange=records[0].exchange,
+                cex_records=records,
+                onchain_records=None,
+            )
+            if output == "summary":
+                console.print(reconciler.format_summary(summary))
+            else:
+                console.print(reconciler.format_summary(summary))
+                _print_cashflow_matches_table(summary)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Cancelled[/yellow]")
+        sys.exit(130)
+    finally:
+        if onchain_provider is not None:
+            asyncio.run(onchain_provider.aclose())
+
+
+@cex_group.command("report", help="Generate HTML cashflow report from cached results.")
+@click.argument("exchange", type=str)
+@click.option("--start-ts", type=int, required=True)
+@click.option("--end-ts", type=int, required=True)
+@click.option("--output", type=click.Path(), default=None,
+              help="Output HTML file path")
+def cex_report_cmd(exchange, start_ts, end_ts, output):
+    """Generate HTML report from cached cashflow."""
+    from .cex.flow import load_cashflow, generate_html_report
+
+    summary = load_cashflow(exchange, start_ts, end_ts)
+    if summary is None:
+        console.print(f"[red]No cached cashflow for '{exchange}' {start_ts}-{end_ts}.[/red]")
+        console.print("Run [yellow]utxo-tracer cex cashflow[/yellow] first to create a cache.")
+        return
+
+    html = generate_html_report(summary, f"CEX Cashflow — {exchange.upper()}")
+    out_path = output or f"cashflow_report_{exchange}_{start_ts}_{end_ts}.html"
+    Path(out_path).write_text(html, encoding="utf-8")
+    console.print(f"[green]Wrote HTML report:[/green] {out_path}")
+
+
+@cex_group.group("cache", help="Manage cached cashflow results.")
+def cex_cache_group() -> None:
+    pass
+
+
+@cex_cache_group.command("list")
+def cex_cache_list():
+    """List cached cashflow reconciliation results."""
+    from .cex.flow import list_cached_cashflows
+
+    entries = list_cached_cashflows()
+    if not entries:
+        console.print("[yellow]No cached cashflow results.[/yellow]")
+        return
+
+    table = Table(title=f"Cached Cashflows ({len(entries)})")
+    table.add_column("Exchange")
+    table.add_column("Start")
+    table.add_column("End")
+    table.add_column("Matches")
+    table.add_column("Unmatched")
+    table.add_column("Inflow")
+    table.add_column("Outflow")
+    for e in entries:
+        table.add_row(
+            e["exchange"],
+            str(e["start"]),
+            str(e["end"][:16] if len(str(e["end"])) > 16 else str(e["end"])),
+            str(e["matches"]),
+            str(e["unmatched"]),
+            f"{e['inflow']:.0f}",
+            f"{e['outflow']:.0f}",
+        )
+    console.print(table)
+
+
+@cex_cache_group.command("clear")
+@click.option("--exchange", type=str, default=None,
+              help="Clear only specific exchange")
+def cex_cache_clear(exchange):
+    """Clear cached cashflow results."""
+    from .cex.flow import clear_cashflow_cache
+
+    count = clear_cashflow_cache(exchange)
+    console.print(f"[green]Cleared {count} cached cashflow result(s).[/green]")
+
+
+@cex_group.command("template", help="Write CSV template for manual CEX data entry.")
+@click.argument("output", type=click.Path(), default="cex_template.csv")
+def cex_template_cmd(output):
+    """Write a CSV template file for manual CEX data entry."""
+    from .cex.flow import write_csv_template
+    write_csv_template(output)
+    console.print(f"[green]Wrote CSV template:[/green] {output}")
+    console.print("Fill in your CEX deposit/withdrawal data and use:")
+    console.print(f"  [yellow]utxo-tracer cex import {output}[/yellow]")
+
+
+@cex_group.command("reconcile-all", help="Run multi-CEX reconciliation.")
+@click.option("--start-ts", type=int, required=True)
+@click.option("--end-ts", type=int, required=True)
+@click.option("--exchanges", type=str, default=None,
+              help="Comma-separated list of exchanges (default: all configured)")
+def cex_reconcile_all_cmd(start_ts, end_ts, exchanges):
+    """Run reconciliation across all configured (or specified) exchanges."""
+    from .cex.flow import multi_cex_reconcile, format_multi_summary
+    import os
+
+    if exchanges:
+        exchange_names = [e.strip().lower() for e in exchanges.split(",")]
+    else:
+        # Auto-detect available exchanges from env vars
+        auto_exchanges = []
+        if os.environ.get("BINANCE_API_KEY"): auto_exchanges.append("binance")
+        if os.environ.get("BYBIT_API_KEY"): auto_exchanges.append("bybit")
+        if os.environ.get("KUCOIN_API_KEY"): auto_exchanges.append("kucoin")
+        if os.environ.get("OKX_API_KEY"): auto_exchanges.append("okx")
+
+        # Also check config.json
+        cfg = load_config()
+        cex_cfg = cfg.get("cex", {})
+        for name in cex_cfg:
+            if name not in auto_exchanges:
+                auto_exchanges.append(name)
+
+        exchange_names = auto_exchanges
+
+    if not exchange_names:
+        console.print("[red]No exchanges configured. Set env vars like:[/red]")
+        console.print("  [green]BINANCE_API_KEY[/green]=xxx [green]BINANCE_API_SECRET[/green]=yyy")
+        console.print("Or see: [yellow]utxo-tracer cex env[/yellow]")
+        sys.exit(1)
+
+    configs = []
+    for name in exchange_names:
+        # Load creds from factory (env → config fallback)
+        from .cex.api.factory import _load_cex_creds
+        creds = _load_cex_creds(name)
+        if not creds.get("api_key"):
+            console.print(f"[yellow]No API key for '{name}', skipping.[/yellow]")
+            continue
+        configs.append({
+            "exchange": name,
+            "api_key": creds["api_key"],
+            "api_secret": creds.get("api_secret", ""),
+            "api_passphrase": creds.get("api_passphrase"),
+            "base_url": creds.get("base_url"),
+        })
+
+    if not configs:
+        console.print("[red]No usable exchange configurations found.[/red]")
+        sys.exit(1)
+
+    async def _run():
+        results = await multi_cex_reconcile(
+            configs, start_ts, end_ts, currency="ADA",
+        )
+        console.print(format_multi_summary(results))
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Cancelled[/yellow]")
+        sys.exit(130)
+
+
+@cex_group.command("hacker-detect", help="Cross-reference UTXO trace with cashflow to find hacker's CEX addresses.\n\nTime window auto-calculated from UTXO block time ± window hours.\nCombines backward trace + CEX cashflow records in that window.")
+@click.argument("utxo", type=str)
+@click.option("--max-depth", type=int, default=None)
+@click.option("--exchange", type=str, required=True,
+              help="Exchange to match against")
+@click.option("--window", type=int, default=24,
+              help="Hours before+after UTXO time (default: 24)")
+@click.option("--api-key", type=str, default=None)
+@click.option("--api-secret", type=str, default=None)
+@click.option("--api-passphrase", type=str, default=None)
+@click.option("--provider", type=str, default="blockfrost")
+@click.option("--bf-api-key", type=str, default=None)
+def cex_hacker_detect_cmd(utxo, max_depth, exchange, window,
+                          api_key, api_secret, api_passphrase,
+                          provider, bf_api_key):
+    """Cross-reference UTXO trace with CEX cashflow to detect hacker's addresses."""
+    from .cex.flow import CashflowReconciler, resolve_utxo_time, format_time_window
+    from .cex.flow.hacker_detect import identify_hacker_cex_addresses
+    from .cex.api.factory import _load_cex_creds
+
+    cfg = load_config()
+
+    # Load CEX creds from env/config
+    creds = _load_cex_creds(exchange)
+    if api_key: creds["api_key"] = api_key
+    if api_secret: creds["api_secret"] = api_secret
+    if api_passphrase: creds["api_passphrase"] = api_passphrase
+
+    if not creds.get("api_key") or not creds.get("api_secret"):
+        console.print(f"[red]No credentials for '{exchange}'.[/red]")
+        console.print(f"Set env vars: [green]{exchange.upper()}_API_KEY[/green] [green]{exchange.upper()}_API_SECRET[/green]")
+        sys.exit(1)
+
+    # Parse UTXO
+    try:
+        start_ref = parse_out_ref(utxo)
+    except ValueError as e:
+        _fatal(str(e))
+
+    max_depth = max_depth or int((cfg.get("defaults") or {}).get("max_depth", 5))
+
+    # Build providers
+    onchain_provider = None
+    if provider or bf_api_key:
+        prov_name = _resolve_provider_name(provider, cfg)
+        prov_cfg = (cfg.get("providers") or {}).get(prov_name, {}) or {}
+        if bf_api_key or prov_cfg.get("api_key"):
+            from .providers import build_provider
+            onchain_provider = build_provider(
+                prov_name, prov_cfg,
+                overrides={"api_key": bf_api_key} if bf_api_key else {},
+            )
+
+    trace_provider = None
+    if provider:
+        trace_provider = onchain_provider
+
+    async def _run():
+        # Step 0: Resolve UTXO → block time → time window
+        console.print(f"[cyan]Resolving time for UTXO {utxo}...[/cyan]")
+        block_time, _ = await resolve_utxo_time(onchain_provider, utxo)
+        st, et = format_time_window(block_time, window, window)
+        console.print(f"  Block time: {block_time} ({_fmt_ts(block_time)})")
+        console.print(f"  Window: ±{window}h → CEX query {st} → {et}")
+
+        # Step 1: Run cashflow reconciliation
+        async with CashflowReconciler(onchain_provider=onchain_provider) as reconciler:
+            console.print(f"[cyan]Fetching CEX records from {exchange}...[/cyan]")
+            summary = await reconciler.reconcile(
+                exchange=exchange,
+                api_key=creds.get("api_key", ""),
+                api_secret=creds.get("api_secret", ""),
+                api_passphrase=creds.get("api_passphrase"),
+                start_time=st,
+                end_time=et,
+            )
+            console.print(reconciler.format_summary(summary))
+
+            # Step 2: Run UTXO trace if we have a provider
+            if trace_provider:
+                console.print(f"[cyan]Tracing UTXO {utxo}...[/cyan]")
+                result = await _do_trace(
+                    trace_provider, start_ref, "backward", max_depth,
+                )
+                _print_summary(result)
+
+                # Step 3: Cross-reference
+                findings = identify_hacker_cex_addresses(result, summary)
+                if findings:
+                    ftable = Table(
+                        title=f"Hacker CEX Addresses Found ({len(findings)})",
+                        header_style="bold red",
+                    )
+                    ftable.add_column("Direction")
+                    ftable.add_column("CEX")
+                    ftable.add_column("Amount")
+                    ftable.add_column("Address", overflow="fold")
+                    for f in findings:
+                        ftable.add_row(
+                            f["direction"],
+                            f["cex"],
+                            f"{f['amount_ada']:.2f} ADA",
+                            f["address"][:20] + "..." if len(f["address"]) > 20 else f["address"],
+                        )
+                    console.print(ftable)
+                else:
+                    console.print("[yellow]No matching CEX addresses found in trace graph.[/yellow]")
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Cancelled[/yellow]")
+        sys.exit(130)
+    finally:
+        if onchain_provider is not None:
+            asyncio.run(onchain_provider.aclose())
 
 
 if __name__ == "__main__":

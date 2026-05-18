@@ -23,16 +23,16 @@ async def trace_forward(
     """Async-generator that walks forward through spent outputs.
 
     Uses edge-based deduplication so diamond patterns preserve all branches.
-    Only kupmios supports get_spent_utxos; other providers yield an error step.
+    Supports kupmios (primary), blockfrost, and koios providers.
     """
-    if provider.provider_type != "kupmios":
+    if provider.provider_type not in ("kupmios", "blockfrost", "koios"):
         yield TraceStep(
             out_ref=start_out_ref,
             direction="forward",
             depth=0,
             error=(
-                f"Forward tracing requires 'kupmios' provider "
-                f"(got '{provider.provider_type}')"
+                f"Forward tracing requires 'kupmios', 'blockfrost', or 'koios' "
+                f"provider (got '{provider.provider_type}')"
             ),
         )
         return

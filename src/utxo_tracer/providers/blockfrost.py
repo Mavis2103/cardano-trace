@@ -136,3 +136,57 @@ class BlockfrostProvider(Provider):
             outputs.append(self._parse_output(tx_hash, o))
 
         return {"inputs": inputs, "input_utxos": input_utxos, "outputs": outputs}
+
+    async def get_tx_block_time(self, tx_hash: str) -> int | None:
+        """Fetch block time for a transaction from Blockfrost."""
+        try:
+            r = await self._client.get(f"/txs/{tx_hash}")
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+            return data.get("block_time")
+        except Exception:
+            return None
+
+    async def get_spent_utxos(self, address: str) -> list[OutRef]:
+        """Find transactions that spent UTXOs from this address (forward tracing).
+
+        Uses Blockfrost /addresses/{address}/transactions to find all TXs
+        involving the address, then checks which ones have this address as input.
+
+        Returns list of OutRefs for the spent outputs.
+        """
+        try:
+            r = await self._client.get(
+                f"/addresses/{address}/transactions",
+                params={"order": "desc", "count": 100},
+            )
+            if r.status_code == 404:
+                return []
+            r.raise_for_status()
+            txs = r.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise
+            return []
+        except Exception:
+            return []
+
+        spent_refs: list[OutRef] = []
+        seen_tx_hashes: set[str] = set()
+
+        for tx in txs:
+            tx_hash = tx.get("tx_hash", "")
+            if not tx_hash or tx_hash in seen_tx_hashes:
+                continue
+            seen_tx_hashes.add(tx_hash)
+            try:
+                tx_data = await self.get_transaction_utxos(tx_hash)
+                for inp in tx_data.get("inputs", []):
+                    if inp.tx_hash:  # valid OutRef
+                        spent_refs.append(inp)
+            except Exception:
+                continue
+
+        return spent_refs

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-from typing import Optional
+from typing import Any, Optional
 
 import dash
 import dash_cytoscape as cyto
 from dash import html
 
 from utxo_tracer.cex.registry import identify_cex
+from utxo_tracer.graph.layout import layout_fr, layout_overlap_remove
 from utxo_tracer.models import Asset, OutRef, TraceResult
 from utxo_tracer.utils import AddressType, classify_address
 
@@ -89,29 +89,84 @@ def _address_type_badge(addr_type: str) -> html.Div:
 
 
 # ---------------------------------------------------------------------------
+# aggregate helpers
+# ---------------------------------------------------------------------------
 
 def _aggregate_assets(result: TraceResult) -> dict[str, int]:
     """Aggregate all assets across UTXOs.  Returns {unit: total_qty}."""
     agg: dict[str, int] = {}
     for node in result.nodes:
         for a in node.assets:
-            if a.unit not in agg:
-                agg[a.unit] = 0
-            agg[a.unit] += a.quantity
+            u = a.unit
+            if u == "lovelace":
+                continue  # ADA tracked separately
+            agg[u] = agg.get(u, 0) + a.quantity
     return agg
 
 
-def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> dash.Dash:
+def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None,
+               cashflow_summary: Optional[Any] = None) -> dash.Dash:
     app = dash.Dash(__name__, title="UTXO Trace")
+
+    # ── cashflow data (if provided) ─────────────────────────────────
+    cashflow_cex_addrs: dict[str, dict] = {}  # address → {match_type, cex}
+    cashflow_rows: list[html.Div] = []
+    if cashflow_summary is not None and hasattr(cashflow_summary, 'matches'):
+        from utxo_tracer.cex.models import CashflowSummary
+        if isinstance(cashflow_summary, CashflowSummary):
+            for m in cashflow_summary.matches:
+                for oc in m.onchain_records:
+                    addr = oc.address
+                    cashflow_cex_addrs[addr] = {
+                        "cex": m.cex_record.exchange,
+                        "match_type": m.match_type,
+                        "confidence": f"{m.confidence*100:.0f}%",
+                        "amount": m.cex_record.amount,
+                        "record_type": m.cex_record.tx_type,
+                    }
+            total = len(cashflow_summary.matches)
+            unmatched = cashflow_summary.total_unmatched_cex
+            rate = cashflow_summary.match_rate
+            cashflow_rows = [
+                html.Div([
+                    html.Span("CexFlow", style={"font-weight": 700, "font-size": "12px", "color": "#f0883e"}),
+                    html.Span(f" ({total} matches, {rate*100:.0f}%)",
+                              style={"font-size": "10px", "color": "#8b949e", "margin-left": 4}),
+                ], style={"margin-bottom": 6}),
+            ]
+            for addr, info in sorted(cashflow_cex_addrs.items(), key=lambda kv: kv[1]["amount"], reverse=True)[:15]:
+                color = "#3fb950" if info["record_type"] == "withdrawal" else "#d29922"
+                label = f"{info['cex']} →" if info["record_type"] == "withdrawal" else f"→ {info['cex']}"
+                cashflow_rows.append(html.Div([
+                    html.Span("●", style={"color": color, "margin-right": 4, "font-size": "8px"}),
+                    html.Span(label, style={"font-size": "9px", "font-weight": 600, "color": color}),
+                    html.Span(f" {info['amount']:.0f} ADA", style={"font-size": "9px", "color": "#e6edf3", "margin-left": 2}),
+                    html.Code(f" {info['confidence']}", style={"font-size": "8px", "color": "#8b949e"}),
+                ], style={"padding": "1px 0", "font-size": "9px"}))
+            if len(cashflow_cex_addrs) > 15:
+                cashflow_rows.append(html.Div(
+                    f"... {len(cashflow_cex_addrs) - 15} more",
+                    style={"font-size": "8px", "color": "#8b949e", "padding": "2px 0"},
+                ))
+    else:
+        cashflow_rows = [html.Div("No cashflow data", style={"font-size": "9px", "color": "#8b949e"})]
+
 
     # ── aggregate data ──────────────────────────────────────────────
     addr_colours: dict[str, str] = {}
     addr_ada: dict[str, float] = {}
+    # Pre-compute address-level data (many nodes can share the same address)
+    addr_type_cache: dict[str, AddressType] = {}
+    addr_cex_cache: dict[str, str] = {}
 
     for node in result.nodes:
-        c = _address_colour(node.address)
-        addr_colours[node.address] = c
-        addr_ada[node.address] = addr_ada.get(node.address, 0.0) + node.ada
+        addr = node.address
+        if addr not in addr_colours:
+            addr_colours[addr] = _address_colour(addr)
+            addr_type_cache[addr] = classify_address(addr)
+            c = identify_cex(addr)
+            addr_cex_cache[addr] = c.name if c else ""
+        addr_ada[addr] = addr_ada.get(addr, 0.0) + node.ada
 
     all_assets = _aggregate_assets(result)
 
@@ -120,12 +175,13 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
 
     for node in result.nodes:
         nid = node.id
-        hex_c = addr_colours[node.address]
-        cex = identify_cex(node.address)
+        addr = node.address
+        hex_c = addr_colours[addr]
+        cex_name = addr_cex_cache[addr]
         is_start = start_out_ref is not None and node.out_ref == start_out_ref
         psize = max(30, min(80, 20 + int(10 * (node.ada ** 0.30))))
 
-        addr_type = classify_address(node.address)
+        addr_type = addr_type_cache[addr]
         native = [a for a in node.assets if not a.is_lovelace]
 
         # Shape by address type
@@ -143,22 +199,28 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
         # Border colour priority: start > CEX > script/byron > default
         if is_start:
             border_color = "#ffd700"  # gold
-        elif cex:
+            border_width = 5
+        elif cex_name:
             border_color = "#f85149"  # red
+            border_width = 4
         elif addr_type == AddressType.SCRIPT:
             border_color = "#d29922"  # amber
+            border_width = 2
         elif addr_type == AddressType.BYRON:
             border_color = "#bc8cff"  # purple
+            border_width = 2
         elif addr_type == AddressType.STAKE:
             border_color = "#3fb950"  # green
+            border_width = 2
         else:
             border_color = "rgba(255,255,255,.35)"
+            border_width = 2
 
         elements.append({
             "data": {
                 "id": nid,
                 "bg_color": hex_c,
-                "address": node.address,
+                "address": addr,
                 "address_type": addr_type.value,
                 "ada": node.ada,
                 "lovelace": node.lovelace,
@@ -167,12 +229,12 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
                 "n_assets": len(native),
                 "assets": json.dumps([{"unit": a.unit, "qty": a.quantity} for a in native]),
                 "is_start": str(is_start).lower(),
-                "cex": cex.name if cex else "",
+                "cex": cex_name,
             },
             "style": {
                 "width": psize, "height": psize,
                 "shape": shape,
-                "border-width": 5 if is_start else (4 if cex else 2),
+                "border-width": border_width,
                 "border-color": border_color,
                 "border-opacity": 1,
             },
@@ -186,7 +248,7 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
             },
         })
 
-    # ── Fruchterman-Reingold force-directed layout ───────────────
+    # ── extract layout data ────────────────────────────────────────
     utxo_ids = [e["data"]["id"] for e in elements if "address" in e.get("data", {})]
     utxo_sizes = {e["data"]["id"]: e["style"]["width"] for e in elements
                   if "address" in e.get("data", {})}
@@ -195,124 +257,8 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
 
     n = len(utxo_ids)
     W, H = 1200, 900
-    positions: dict[str, dict] = {}
-
-    if n == 1:
-        positions[utxo_ids[0]] = {"x": W/2, "y": H/2}
-    elif n > 1:
-        import random as _r
-        _r.seed(42)
-        pos: dict[str, list[float]] = {}
-        for i, nid in enumerate(utxo_ids):
-            a = 2 * math.pi * i / n
-            r = min(W/2 - 10, max(200, n * 14))
-            pos[nid] = [
-                W/2 + r * math.cos(a) + _r.uniform(-30, 30),
-                H/2 + r * math.sin(a) + _r.uniform(-30, 30),
-            ]
-        k = math.sqrt(W * H / n) * 0.95
-        temp = W / 5
-        for it in range(120):
-            t = temp * (1 - it / 120)
-            disp = {nid: [0.0, 0.0] for nid in utxo_ids}
-            for i in range(n):
-                for j in range(i + 1, n):
-                    u, v = utxo_ids[i], utxo_ids[j]
-                    dx = pos[u][0] - pos[v][0]
-                    dy = pos[u][1] - pos[v][1]
-                    d = max(math.sqrt(dx*dx + dy*dy), 1)
-                    force = k*k / d
-                    fu = force * (utxo_sizes.get(u, 60) + 40) / d
-                    fv = force * (utxo_sizes.get(v, 60) + 40) / d
-                    disp[u][0] += dx/d * fu
-                    disp[u][1] += dy/d * fu
-                    disp[v][0] -= dx/d * fv
-                    disp[v][1] -= dy/d * fv
-            for u, v in edge_pairs:
-                if u not in pos or v not in pos:
-                    continue
-                dx = pos[v][0] - pos[u][0]
-                dy = pos[v][1] - pos[u][1]
-                d = max(math.sqrt(dx*dx + dy*dy), 1)
-                f = d*d / k
-                disp[u][0] += dx/d * f
-                disp[u][1] += dy/d * f
-                disp[v][0] -= dx/d * f
-                disp[v][1] -= dy/d * f
-            grav = 0.005 * (10 / max(n, 10))
-            for nid in utxo_ids:
-                dx = W/2 - pos[nid][0]
-                dy = H/2 - pos[nid][1]
-                pos[nid][0] += dx * grav
-                pos[nid][1] += dy * grav
-            # apply displacement
-            for nid in utxo_ids:
-                d = max(math.sqrt(disp[nid][0]**2 + disp[nid][1]**2), 0.01)
-                pos[nid][0] += disp[nid][0] / d * min(abs(disp[nid][0]), t)
-                pos[nid][1] += disp[nid][1] / d * min(abs(disp[nid][1]), t)
-        for nid in utxo_ids:
-            positions[nid] = {"x": pos[nid][0], "y": pos[nid][1]}
-
-    # ── overlap removal (size-aware, guarantees arrow visibility) ──
-    if n > 1:
-        # Dynamic gap: logarithmic — smooth growth, plateaus for large graphs
-        import math as _m
-        GAP = max(20, min(80, int(15 + 18 * _m.log(n))))
-        EDGE_GAP = max(40, min(120, int(30 + 22 * _m.log(n))))
-        for _ in range(30):
-            moved = 0
-            # node–node separation
-            for i in range(n):
-                for j in range(i + 1, n):
-                    u, v = utxo_ids[i], utxo_ids[j]
-                    dx = positions[v]["x"] - positions[u]["x"]
-                    dy = positions[v]["y"] - positions[u]["y"]
-                    d = math.sqrt(dx * dx + dy * dy)
-                    r1 = utxo_sizes.get(u, 60) / 2
-                    r2 = utxo_sizes.get(v, 60) / 2
-                    need = r1 + r2 + GAP
-                    if d < need and d > 0.01:
-                        push = (need - d) * 0.3
-                        nx, ny = dx / d, dy / d
-                        w = r2 / (r1 + r2)
-                        positions[u]["x"] -= nx * push * (1 - w)
-                        positions[u]["y"] -= ny * push * (1 - w)
-                        positions[v]["x"] += nx * push * w
-                        positions[v]["y"] += ny * push * w
-                        moved += 1
-            # node–edge repulsion (prevent nodes sitting on edges)
-            for u, v in edge_pairs:
-                if u not in positions or v not in positions:
-                    continue
-                p1 = (positions[u]["x"], positions[u]["y"])
-                p2 = (positions[v]["x"], positions[v]["y"])
-                vx, vy = p2[0] - p1[0], p2[1] - p1[1]
-                elen = math.sqrt(vx*vx + vy*vy)
-                if elen < 1:
-                    continue
-                ex, ey = vx / elen, vy / elen
-                for w in utxo_ids:
-                    if w == u or w == v:
-                        continue
-                    wx, wy = positions[w]["x"], positions[w]["y"]
-                    # project w onto edge line
-                    t = ((wx - p1[0]) * ex + (wy - p1[1]) * ey) / elen
-                    t = max(0, min(1, t))  # clamp to segment
-                    cx, cy = p1[0] + t * ex, p1[1] + t * ey
-                    dx = wx - cx
-                    dy = wy - cy
-                    d = math.sqrt(dx*dx + dy*dy)
-                    rw = utxo_sizes.get(w, 60) / 2
-                    edge_dist = d - rw
-                    edge_gap = EDGE_GAP  # dynamic: more nodes → larger gap
-                    if edge_dist < edge_gap and d > 0.01:
-                        push = (edge_gap - edge_dist) * 0.3
-                        ndx, ndy = dx / d, dy / d
-                        positions[w]["x"] += ndx * push
-                        positions[w]["y"] += ndy * push
-                        moved += 1
-            if moved == 0:
-                break
+    positions = layout_fr(utxo_ids, utxo_sizes, edge_pairs, n, W, H)
+    layout_overlap_remove(positions, utxo_ids, utxo_sizes, edge_pairs, n)
 
     for el in elements:
         eid = el["data"].get("id")
@@ -396,7 +342,7 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
 
     for addr, _ in sorted_addrs[:20]:
         c = addr_colours[addr]
-        _type = classify_address(addr)
+        _type = addr_type_cache[addr]
         _tlabel, _tcolor = _TYPE_LABEL.get(_type, ("?", "#8b949e"))
         legend_rows.append(html.Div([
             html.Span(style={
@@ -477,6 +423,19 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
                 }),
                 html.Div(children=asset_rows, style={"margin-top": 6}),
             ], open=True, style={"margin-top": 4}),
+            # Cashflow section
+            html.Details([
+                html.Summary([
+                    html.Span("Cashflow", style={"font-weight": 700, "font-size": "12px",
+                                                  "color": "#f0883e"}),
+                    html.Span(f" ({len(cashflow_cex_addrs)})", style={"font-size": "10px",
+                              "color": "#8b949e", "margin-left": 4}),
+                ], style={
+                    "cursor": "pointer", "outline": "none",
+                    "display": "flex", "align-items": "center",
+                }),
+                html.Div(children=cashflow_rows, style={"margin-top": 6}),
+            ], open=bool(cashflow_cex_addrs), style={"margin-top": 4}),
         ]),
 
         # Detail panel (hidden by default)
@@ -602,13 +561,14 @@ def create_app(result: TraceResult, start_out_ref: Optional[OutRef] = None) -> d
 
 def start_server(result: TraceResult, start_out_ref: Optional[OutRef] = None,
                  port: int = 8050, debug: bool = False,
-                 cache_key: str = "") -> None:
+                 cache_key: str = "",
+                 cashflow_summary: Any = None) -> None:
     """Create Dash app and start server (blocking).
     
     If cache_key is provided, loads saved visualization state (node positions,
     zoom, pan) and saves state on exit.
     """
-    app = create_app(result, start_out_ref)
+    app = create_app(result, start_out_ref, cashflow_summary=cashflow_summary)
 
     # ── restore saved viz state ───────────────────────────────────
     if cache_key:

@@ -179,12 +179,14 @@ def save_trace(
     return key
 
 
-def load_trace(start_out_ref: OutRef, direction: str, max_depth: int) -> Optional[TraceResult]:
-    """Load trace result from cache, or None if not cached."""
-    key = _cache_key(start_out_ref, direction, max_depth)
-    path = TRACES_DIR / f"{key}.json"
-    if not path.exists():
-        return None
+def _load_trace_file(
+    path: Path,
+    start_out_ref: OutRef,
+    direction: str,
+    max_depth: int,
+    key: str,
+) -> Optional[TraceResult]:
+    """Load a trace result from a specific cache file."""
     try:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
@@ -230,8 +232,95 @@ def load_trace(start_out_ref: OutRef, direction: str, max_depth: int) -> Optiona
     )
 
 
+def load_trace(start_out_ref: OutRef, direction: str, max_depth: int) -> Optional[TraceResult]:
+    """Load trace result from cache, or None if not cached.
+
+    Depth-progressive: if no exact-depth match exists but a deeper trace
+    of the same start UTXO is found in the global store, reconstructs
+    a subgraph up to *max_depth* — no provider calls needed.
+    """
+    # 1. Exact key match
+    key = _cache_key(start_out_ref, direction, max_depth)
+    path = TRACES_DIR / f"{key}.json"
+    if path.exists():
+        result = _load_trace_file(path, start_out_ref, direction, max_depth, key)
+        if result is not None:
+            return result
+
+    # 2. Depth-progressive fallback: check store & index
+    store = _load_store()
+    store_nodes = store.get("nodes", {})
+    store_inputs = store.get("inputs", {})
+    if not store_nodes:
+        return None
+
+    start_id = start_out_ref.node_id()
+    if start_id not in store_nodes:
+        return None
+
+    # Build reverse index for forward direction: outputs[source] → [targets]
+    from collections import deque
+    outputs_of: dict[str, list[str]] = {}
+    if direction in ("forward", "both"):
+        for target, sources in store_inputs.items():
+            for src in sources:
+                outputs_of.setdefault(src, []).append(target)
+
+    # BFS from start up to max_depth using stored edges
+    visited: set[str] = set()
+    q: deque[tuple[str, int]] = deque([(start_id, 0)])
+    while q:
+        cur_id, depth = q.popleft()
+        if cur_id in visited or depth > max_depth:
+            continue
+        visited.add(cur_id)
+        if direction == "forward":
+            for nxt in outputs_of.get(cur_id, []):
+                if nxt not in visited:
+                    q.append((nxt, depth + 1))
+        else:
+            for src in store_inputs.get(cur_id, []):
+                if src not in visited:
+                    q.append((src, depth + 1))
+
+    if not visited:
+        return None
+
+    # Build result from visited set
+    nodes = [_node_from_dict(store_nodes[nid])
+             for nid in sorted(visited)
+             if nid in store_nodes]
+    edges = []
+    for nid in visited:
+        for src in store_inputs.get(nid, []):
+            if src in visited:
+                eid = f"{nid}->{src}"
+                edges.append(TransactionEdge(
+                    id=eid, source=src, target=nid,
+                    direction="input",
+                ))
+    traced_path = list(visited)
+    return TraceResult(
+        nodes=nodes, edges=edges, traced_path=traced_path,
+        start_out_ref=start_out_ref, direction=direction,
+        max_depth=max_depth,
+    )
+
+
 def has_trace(start_out_ref: OutRef, direction: str, max_depth: int) -> bool:
-    return (TRACES_DIR / f"{_cache_key(start_out_ref, direction, max_depth)}.json").exists()
+    """Check if a trace is cached either by exact key or via deeper cached trace."""
+    # Exact match
+    if (TRACES_DIR / f"{_cache_key(start_out_ref, direction, max_depth)}.json").exists():
+        return True
+    # Depth-progressive: check index for any deeper trace of same start+dir
+    start_str = f"{start_out_ref.tx_hash}#{start_out_ref.output_index}"
+    index = _load_index()
+    for meta in index.values():
+        if (meta.get("start") == start_str
+                and meta.get("direction") == direction
+                and meta.get("max_depth", 0) >= max_depth):
+            return True
+    return False
 
 
 def find_node_in_cache(node_id: str, direction: str = "backward",

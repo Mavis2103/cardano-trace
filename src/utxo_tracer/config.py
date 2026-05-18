@@ -93,6 +93,11 @@ _ENV_OVERRIDE_VARS = [
     "BLOCKFROST_API_KEY", "BLOCKFROST_BASE_URL", "BLOCKFROST_ENDPOINT_URL",
     "KOIOS_API_KEY", "KOIOS_BASE_URL",
     "MAESTRO_API_KEY", "MAESTRO_BASE_URL",
+    # CEX env vars
+    "BINANCE_API_KEY", "BINANCE_API_SECRET",
+    "BYBIT_API_KEY", "BYBIT_API_SECRET",
+    "KUCOIN_API_KEY", "KUCOIN_API_SECRET", "KUCOIN_API_PASSPHRASE",
+    "OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE",
 ]
 
 
@@ -141,6 +146,17 @@ def _env_overlay(base: dict[str, Any]) -> dict[str, Any]:
     _set(["providers", "kupmios", "kupo_api_key"], os.getenv("KUPO_API_KEY"))
     _set(["providers", "kupmios", "ogmios_url"], os.getenv("OGMIOS_URL"))
     _set(["providers", "kupmios", "ogmios_api_key"], os.getenv("OGMIOS_API_KEY"))
+    # CEX env vars
+    _set(["cex", "binance", "api_key"], os.getenv("BINANCE_API_KEY"))
+    _set(["cex", "binance", "api_secret"], os.getenv("BINANCE_API_SECRET"))
+    _set(["cex", "bybit", "api_key"], os.getenv("BYBIT_API_KEY"))
+    _set(["cex", "bybit", "api_secret"], os.getenv("BYBIT_API_SECRET"))
+    _set(["cex", "kucoin", "api_key"], os.getenv("KUCOIN_API_KEY"))
+    _set(["cex", "kucoin", "api_secret"], os.getenv("KUCOIN_API_SECRET"))
+    _set(["cex", "kucoin", "api_passphrase"], os.getenv("KUCOIN_API_PASSPHRASE"))
+    _set(["cex", "okx", "api_key"], os.getenv("OKX_API_KEY"))
+    _set(["cex", "okx", "api_secret"], os.getenv("OKX_API_SECRET"))
+    _set(["cex", "okx", "api_passphrase"], os.getenv("OKX_API_PASSPHRASE"))
     return cfg
 
 

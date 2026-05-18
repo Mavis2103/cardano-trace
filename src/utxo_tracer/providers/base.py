@@ -30,6 +30,12 @@ class Provider(ABC):
             f"{self.provider_type} does not support forward tracing"
         )
 
+    async def get_tx_block_time(self, tx_hash: str) -> int | None:
+        """Return the block time (unix epoch) for a transaction, or None.
+        
+        Override in providers that support it (Blockfrost, Koios)."""
+        return None
+
     async def aclose(self) -> None:
         """Override to release HTTP clients."""
         return None
