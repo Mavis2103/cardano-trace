@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"python -c \\\"\\nimport os, tempfile, pathlib\\n# Simulate .env file\\nenv_content = 'BLOCKFROST_API_KEY=test_key_123\\\\nBLOCKFROST_AUTH_TYPE=bearer\\\\nUTXO_TRACER_PROVIDER=blockfrost\\\\n'\\nwith t...",
-  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 9, in <module>\nModuleNotFoundError: No module named 'utxo_tracer'",
-  "timestamp": "2026-05-14T15:11:59.603Z",
-  "retry_count": 1
-}
