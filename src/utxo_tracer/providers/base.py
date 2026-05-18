@@ -1,0 +1,50 @@
+"""Abstract provider base class."""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from ..models import OutRef, UTxONode
+
+
+class Provider(ABC):
+    """Abstract base class for UTXO data providers."""
+
+    provider_type: str = "base"
+
+    @abstractmethod
+    async def health_check(self) -> bool:
+        """Return True if provider is reachable and authorized."""
+
+    @abstractmethod
+    async def get_utxo_by_out_ref(self, out_ref: "OutRef") -> Optional["UTxONode"]:
+        """Resolve a single UTXO by its output reference."""
+
+    @abstractmethod
+    async def get_transaction_utxos(self, tx_hash: str) -> dict:
+        """Return {'inputs': list[OutRef], 'outputs': list[UTxONode]}."""
+
+    async def get_spent_utxos(self, address: str) -> list["OutRef"]:
+        raise NotImplementedError(
+            f"{self.provider_type} does not support forward tracing"
+        )
+
+    async def aclose(self) -> None:
+        """Override to release HTTP clients."""
+        return None
+
+    async def __aenter__(self) -> "Provider":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
+
+class CapabilityError(Exception):
+    """Raised when a provider lacks a required capability (e.g. no DumpHistory)."""
+
+    def __init__(self, provider_name: str, reason: str = "") -> None:
+        self.provider_name = provider_name
+        self.reason = reason
+        super().__init__(f"{provider_name}: {reason}" if reason else provider_name)
