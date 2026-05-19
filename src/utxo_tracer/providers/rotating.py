@@ -76,7 +76,7 @@ class RotatingKeyProvider(Provider):
                 last_error = e
                 if e.response.status_code == 429:
                     rotations += 1
-                    logger.warning(
+                    logger.debug(
                         "Rate-limited (429) on %s/%s — rotating key (attempt %d/%d)",
                         key_name, method, rotations, self._max_rotations,
                     )
@@ -96,7 +96,7 @@ class RotatingKeyProvider(Provider):
         async with self._lock:
             self._current = (self._current + 1) % self._count
             new_name = self._instances[self._current][0]
-            logger.info(
+            logger.debug(
                 "Rotated to key %d/%d: %s",
                 self._current + 1, self._count, new_name,
             )

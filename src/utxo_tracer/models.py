@@ -101,6 +101,7 @@ class AddressInteractionNode:
     is_cex: bool = False
     cex_name: str = ""
     is_target: bool = False
+    depth: int = 0  # hop distance from target address
 
 
 @dataclass
@@ -118,6 +119,7 @@ class AddressInteractionEdge:
     tx_hashes: list[str] = field(default_factory=list)
     interaction_count: int = 0
     direction_relative_to_target: str = "unknown"
+    source_depth: int = 0  # depth at which this edge was discovered
 
 
 @dataclass
@@ -129,6 +131,7 @@ class AddressTraceResult:
     total_transactions: int = 0
     error: Optional[str] = None
     provider_name: str = ""
+    max_depth: int = 1
 
 
 @dataclass

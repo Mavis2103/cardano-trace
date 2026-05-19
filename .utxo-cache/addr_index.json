@@ -26,5 +26,28 @@
     "edges": 59,
     "tx_limit": 101,
     "created_at": 1779159565.93842
+  },
+  "caba2f78b6ec87a7_11": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 14,
+    "edges": 16,
+    "tx_limit": 11,
+    "created_at": 1779165641.663759
+  },
+  "6c23d5d3d23ad6d7_10": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 10,
+    "edges": 12,
+    "tx_limit": 10,
+    "max_depth": 1,
+    "created_at": 1779173908.3739376
+  },
+  "6c23d5d3d23ad6d7_11": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 12,
+    "edges": 15,
+    "tx_limit": 11,
+    "max_depth": 1,
+    "created_at": 1779173937.7342803
   }
 }

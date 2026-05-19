@@ -855,17 +855,17 @@ def clear_cache() -> int:
 ADDR_INDEX_FILE = CACHE_DIR / "addr_index.json"
 
 
-def _addr_cache_key(address: str) -> str:
-    key_str = f"addr:{address}"
+def _addr_cache_key(address: str, max_depth: int = 1) -> str:
+    key_str = f"addr:{address}:d{max_depth}"
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
-def _addr_manifest_key(address: str) -> str:
-    return f"addr_{_addr_cache_key(address)}"
+def _addr_manifest_key(address: str, max_depth: int = 1) -> str:
+    return f"addr_{_addr_cache_key(address, max_depth)}"
 
 
-def _addr_manifest_path(address: str) -> Path:
-    return MANIFESTS_DIR / f"{_addr_manifest_key(address)}.json"
+def _addr_manifest_path(address: str, max_depth: int = 1) -> Path:
+    return MANIFESTS_DIR / f"{_addr_manifest_key(address, max_depth)}.json"
 
 
 def save_address_trace_step(
@@ -875,6 +875,7 @@ def save_address_trace_step(
     discovered_utxos: list[UTxONode],
     total_count: int,
     tx_limit: int = 0,
+    max_depth: int = 1,
 ) -> None:
     """Save single-step progress for an address trace (like save_trace_step).
 
@@ -895,9 +896,10 @@ def save_address_trace_step(
         tx_limit: The ``--tx-limit`` value at time of run (0 = no limit).
             Stored in the manifest so later runs with a larger limit
             know to extend instead of loading stale cache.
+        max_depth: The ``--max-depth`` value at time of run (default: 1).
     """
     _ensure_dirs()
-    path = _addr_manifest_path(address)
+    path = _addr_manifest_path(address, max_depth)
     try:
         if path.exists():
             manifest = json.loads(path.read_text())
@@ -907,6 +909,7 @@ def save_address_trace_step(
                 "address": address,
                 "total_tx_count": total_count,
                 "tx_limit": tx_limit,
+                "max_depth": max_depth,
                 "completed": False,
                 "created_at": time.time(),
                 "tx_hashes_processed": [],
@@ -927,6 +930,10 @@ def save_address_trace_step(
                 manifest["tx_limit"] = tx_limit
             if tx_limit == 0 and existing_limit != 0:
                 manifest["tx_limit"] = 0
+            # Update max_depth if current run goes deeper
+            existing_depth = manifest.get("max_depth", 1)
+            if max_depth > existing_depth:
+                manifest["max_depth"] = max_depth
 
         _atomic_write(path, json.dumps(manifest, indent=2, default=str))
 
@@ -945,21 +952,23 @@ class CachedAddrTrace(NamedTuple):
         total: Total number of tx hashes known for this address.
         tx_limit: The ``--tx-limit`` used when this cache was created
             (0 = no limit / all transactions).
+        max_depth: The ``--max-depth`` used when this cache was created.
         completed: Whether the trace completed normally.
     """
     processed: set[str]
     failed: set[str]
     total: int
     tx_limit: int
-    completed: bool
+    max_depth: int = 1
+    completed: bool = False
 
 
-def load_address_trace_partial(address: str) -> Optional[CachedAddrTrace]:
+def load_address_trace_partial(address: str, max_depth: int = 1) -> Optional[CachedAddrTrace]:
     """Load partial address trace progress.
 
     Returns None if no manifest exists (first-time query).
     """
-    path = _addr_manifest_path(address)
+    path = _addr_manifest_path(address, max_depth)
     if not path.exists():
         return None
     try:
@@ -969,15 +978,16 @@ def load_address_trace_partial(address: str) -> Optional[CachedAddrTrace]:
             failed=set(manifest.get("tx_hashes_failed", [])),
             total=manifest.get("total_tx_count", 0),
             tx_limit=manifest.get("tx_limit", 0),
+            max_depth=manifest.get("max_depth", 1),
             completed=manifest.get("completed", False),
         )
     except (json.JSONDecodeError, OSError):
         return None
 
 
-def finalize_address_trace(address: str) -> None:
+def finalize_address_trace(address: str, max_depth: int = 1) -> None:
     """Mark an address trace manifest as completed."""
-    path = _addr_manifest_path(address)
+    path = _addr_manifest_path(address, max_depth)
     if not path.exists():
         return
     try:
@@ -994,19 +1004,22 @@ def _addr_result_to_dict(result: AddressTraceResult, cache_key: str) -> dict:
         "target_address": result.target_address,
         "total_transactions": result.total_transactions,
         "error": result.error, "provider_name": result.provider_name,
+        "max_depth": result.max_depth,
         "addresses": [
             {"address": n.address, "address_type": n.address_type,
              "total_ada": n.total_ada, "net_ada": n.net_ada,
              "total_incoming_ada": n.total_incoming_ada,
              "total_outgoing_ada": n.total_outgoing_ada,
              "tx_count": n.tx_count,
-             "is_cex": n.is_cex, "cex_name": n.cex_name, "is_target": n.is_target}
+             "is_cex": n.is_cex, "cex_name": n.cex_name, "is_target": n.is_target,
+             "depth": n.depth}
             for n in result.addresses
         ],
         "edges": [
             {"source": e.source, "target": e.target,
              "tx_hashes": e.tx_hashes, "interaction_count": e.interaction_count,
-             "direction_relative_to_target": e.direction_relative_to_target}
+             "direction_relative_to_target": e.direction_relative_to_target,
+             "source_depth": e.source_depth}
             for e in result.edges
         ],
     }
@@ -1026,6 +1039,7 @@ def _addr_result_from_dict(data: dict, target_address: str) -> Optional[AddressT
                 is_cex=n.get("is_cex", False),
                 cex_name=n.get("cex_name", ""),
                 is_target=n.get("is_target", False),
+                depth=n.get("depth", 0),
             )
             for n in data.get("addresses", [])
         ]
@@ -1035,6 +1049,7 @@ def _addr_result_from_dict(data: dict, target_address: str) -> Optional[AddressT
                 tx_hashes=e.get("tx_hashes", []),
                 interaction_count=e.get("interaction_count", len(e.get("tx_hashes", []))),
                 direction_relative_to_target=e.get("direction_relative_to_target", "unknown"),
+                source_depth=e.get("source_depth", 0),
             )
             for e in data.get("edges", [])
         ]
@@ -1044,20 +1059,22 @@ def _addr_result_from_dict(data: dict, target_address: str) -> Optional[AddressT
             total_transactions=data.get("total_transactions", data.get("transactions_examined", 0)),
             error=data.get("error"),
             provider_name=data.get("provider_name", ""),
+            max_depth=data.get("max_depth", 1),
         )
     except Exception as e:
         logger.warning("Failed to parse cached address trace: %s", e)
         return None
 
 
-def save_address_trace(result: AddressTraceResult, tx_limit: int = 0) -> str:
+def save_address_trace(result: AddressTraceResult, tx_limit: int = 0, max_depth: int = 1) -> str:
     """Save v2 address trace snapshot.
 
-    The cache key includes ``tx_limit`` so different limits produce
-    different snapshot files — just like UTXO trace's depth-based keys.
+    The cache key includes ``tx_limit`` and ``max_depth`` so different
+    depths produce different snapshot files — just like UTXO trace's
+    depth-based keys.
     """
     _ensure_dirs()
-    key = _addr_cache_key(result.target_address)
+    key = _addr_cache_key(result.target_address, max_depth)
     suffix = f"_{tx_limit}" if tx_limit else ""
     file_key = f"{key}{suffix}"
     index = _load_addr_index()
@@ -1066,16 +1083,18 @@ def save_address_trace(result: AddressTraceResult, tx_limit: int = 0) -> str:
         "addresses": len(result.addresses),
         "edges": len(result.edges),
         "tx_limit": tx_limit,
+        "max_depth": max_depth,
         "created_at": time.time(),
     }
     _save_addr_index(index)
     data = _addr_result_to_dict(result, key)
     data["tx_limit"] = tx_limit
+    data["max_depth"] = max_depth
     _atomic_write(TRACES_DIR / f"{file_key}.json", json.dumps(data, indent=2, default=str))
     return key
 
 
-def load_address_trace(address: str, tx_limit: int = 0) -> Optional[AddressTraceResult]:
+def load_address_trace(address: str, tx_limit: int = 0, max_depth: int = 1) -> Optional[AddressTraceResult]:
     """Load a v2 address trace snapshot.
 
     Args:
@@ -1083,8 +1102,10 @@ def load_address_trace(address: str, tx_limit: int = 0) -> Optional[AddressTrace
         tx_limit: Required minimum ``--tx-limit``. If the cached snapshot
             was created with a smaller limit, it won't be loaded
             (caller should extend instead). 0 = match any limit.
+        max_depth: Required minimum ``--max-depth``. If the cached
+            snapshot was created with a smaller depth, skip it.
     """
-    key = _addr_cache_key(address)
+    key = _addr_cache_key(address, max_depth)
     # Try exact-tx_limit file first, then fall back to no-limit
     candidates = [f"{key}_{tx_limit}"] if tx_limit else []
     candidates.append(key)
@@ -1097,6 +1118,9 @@ def load_address_trace(address: str, tx_limit: int = 0) -> Optional[AddressTrace
                 stored_limit = data.get("tx_limit", 0)
                 if tx_limit and stored_limit and stored_limit < tx_limit:
                     continue  # insufficient coverage — skip
+                stored_depth = data.get("max_depth", 1)
+                if max_depth > stored_depth:
+                    continue  # insufficient depth — skip
                 return _addr_result_from_dict(data, address)
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load cached address trace: %s", e)

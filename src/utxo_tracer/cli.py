@@ -417,7 +417,18 @@ async def _run_trace(
                 and step.utxo
                 and step.out_ref.node_id() in cached_nodes
             )
-            source_tag = "[dim](cached)[/dim]" if is_cached else getattr(provider, 'current_provider', '') or ''
+            source_tag = (
+                getattr(provider, 'current_provider', '')
+                or getattr(provider, 'provider_type', '')
+                or ''
+            )
+            if is_cached:
+                source_tag = ""
+            elif source_tag:
+                source_tag = f"[dim]{source_tag}[/dim]"
+            else:
+                # Emergency fallback — should never reach here
+                source_tag = "[red]?[/red]"
 
             # Per-step cache: save immediately (even failed steps)
             if store is not None and store_module is not None and trace_key:
@@ -438,8 +449,9 @@ async def _run_trace(
                         direction, store,
                     )
 
+            node_label = shorten(step.out_ref.node_id(), 12, 6)
             progress.update(task_id, advance=1,
-                description=f"[cyan]{direction}[/cyan] depth={step.depth} nodes={nodes_found} errors={errors_found} {source_tag}")
+                description=f"[cyan]{direction}[/cyan] depth={step.depth} node={node_label} errors={errors_found} {source_tag}")
         # Summary: count cached vs live
         _cached_count = sum(
             1 for s in steps
@@ -488,8 +500,7 @@ async def _do_trace(
         all_steps: list[TraceStep] = []
         err: Optional[str] = None
         if direction in ("backward", "both"):
-            pname = getattr(provider, "current_provider", "") or ""
-            task = progress.add_task(f"[cyan]backward[/cyan] tracing... [dim]{pname}[/dim]", total=None)
+            task = progress.add_task(f"[cyan]backward[/cyan] tracing...", total=None)
             bsteps, berr, berrors = await _run_trace(
                 provider, start, "backward", max_depth, progress, task,
                 cached_nodes=_cached_nodes, cached_inputs=_cached_inputs,
@@ -501,8 +512,7 @@ async def _do_trace(
             if store is not None:
                 _cache_mod.save_store_file(store)
         if direction in ("forward", "both"):
-            pname = getattr(provider, "current_provider", "") or ""
-            task = progress.add_task(f"[cyan]forward[/cyan] tracing... [dim]{pname}[/dim]", total=None)
+            task = progress.add_task(f"[cyan]forward[/cyan] tracing...", total=None)
             fsteps, ferr, _ferrors = await _run_trace(
                 provider, start, "forward", max_depth, progress, task,
                 cached_nodes=_cached_nodes, cached_outputs=_cached_outputs,
@@ -641,20 +651,21 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
                         start_server(cached_result, start_out_ref=start, cache_key=ck)
                         return
                     # No v2 snapshot (e.g. old manifest from interrupted trace) — rebuild
-                    console.print("[green]Loaded from per-step cache[/green]")
+                    console.print("[green]Cache: per-step manifest — rebuilding[/green]")
 
             if cached_partial.failed_nodes:
-                console.print(f"[yellow]Partial cache: {len(cached_partial.cached_steps)} steps OK, "
-                              f"{len(cached_partial.failed_nodes)} to re-query"
-                              f"{', depth ' + str(cached_partial.cached_max_depth) + ' → ' + str(max_depth) if cached_partial.cached_max_depth < max_depth else ''}[/yellow]")
+                msg = f"[yellow]Cache: {len(cached_partial.cached_steps)} OK, {len(cached_partial.failed_nodes)} failed — re-query"
+                if cached_partial.cached_max_depth < max_depth:
+                    msg += f" (depth {cached_partial.cached_max_depth}\u2192{max_depth})"
+                console.print(msg + "[/yellow]")
             elif cached_partial.cached_max_depth < max_depth:
-                console.print(f"[yellow]Partial cache: depth {cached_partial.cached_max_depth} → {max_depth}, extending[/yellow]")
+                console.print(f"[yellow]Cache: depth {cached_partial.cached_max_depth} \u2192 {max_depth} — extending[/yellow]")
         else:
             # 2. Try v2 snapshot (backward compat)
             cached_result = cache_mod.load_trace(start, direction, max_depth)
             if cached_result is not None:
                 if getattr(cached_result, "errors_count", 0) > 0:
-                    console.print("[yellow]Cached trace had errors — re-tracing missing UTXOs[/yellow]")
+                    console.print(f"[yellow]Cache: snapshot has {cached_result.errors_count} errors — re-tracing[/yellow]")
                 else:
                     console.print("[green]Loaded from local cache[/green]")
                     from .graph.dash_app import start_server
@@ -710,14 +721,14 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
         console.print(f"[green]Exported edges CSV:[/green] {e_path}")
     from .graph.dash_app import start_server
     if dash:
-        console.print("[green]Starting Dash Cytoscape graph...[/green]")
+        console.print("[green]Starting graph visualization...[/green]")
         Timer(1.5, _open_browser).start()
         ck = cache_mod._cache_key(start, direction, max_depth) if not no_cache else ""
         start_server(result, start_out_ref=start, cache_key=ck, cashflow_summary=None)
     else:
-        console.print("[green]Trace complete. Use --dash to open interactive graph.[/green]")
+        console.print("[green]Trace complete — use --dash to view graph[/green]")
     if result.error:
-        err_console.print(f"[red]Trace ended with error:[/red] {result.error}")
+        err_console.print(f"[red]\u2717 Trace failed: {result.error}[/red]")
         sys.exit(2)
 
 
@@ -733,7 +744,9 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
 @click.option("--ogmios-url", type=str, default=None)
-@click.option("--tx-limit", type=int, default=None, help="Optional cap on transactions to examine. Default: no limit (fetch all pages).")
+@click.option("--tx-limit", type=int, default=None, help="Optional cap on transactions per address level. Default: no limit (fetch all pages).")
+@click.option("--max-depth", type=int, default=1, help="How many hops to trace (default: 1 = direct interactions only). "
+              "Depth 2 traces interactors of interactors, etc.")
 @click.option("--output", type=click.Choice(["table", "json", "csv"]), default="table")
 @click.option("--export-json", type=click.Path(dir_okay=False), default=None)
 @click.option("--export-csv", type=click.Path(), default=None)
@@ -744,7 +757,7 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
 @click.option("--proxy-url", type=str, default="http://localhost:3001")
 @click.option("--no-cache", is_flag=True, default=False, help="Skip local cache; always query providers.")
 def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_url,
-                       kupo_url, ogmios_url, tx_limit, output,
+                       kupo_url, ogmios_url, tx_limit, max_depth, output,
                        export_json, export_csv, fallback, cex_file,
                        dash, use_proxy, proxy_url, no_cache):
     """Trace all addresses that have interacted with the given address.
@@ -752,6 +765,9 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
     Examines ALL transactions involving the address (or --tx-limit if set),
     then builds a directed interaction graph showing connected addresses,
     fund flow direction, and net ADA values.
+
+    Use --max-depth N to trace multiple hops (default: 1 = direct only).
+    At depth 2, each interactor's transactions are also examined.
     """
     cfg = load_config()
     if cex_file:
@@ -761,14 +777,18 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
         except Exception as e:
             err_console.print(f"[yellow]Warning loading CEX file:[/yellow] {e}")
 
-    # --- cache check (manifest + v2 snapshot, like UTXO trace) ---
+    # --- cache check (manifest + v2 snapshot, identical to UTXO trace) ---
     skip_tx_hashes: set[str] = set()
+    cached_tx_count = 0  # for end-of-run cached/live summary
     # Normalize tx_limit: None (not specified) → 0 (all transactions)
     effective_tx_limit = tx_limit if tx_limit is not None else 0
 
-    if not no_cache:
+    # Multi-hop cache: skip for now (depth-aware caching to be implemented)
+    _skip_cache = max_depth > 1
+
+    if not no_cache and not _skip_cache:
         # 1. Try manifest for partial progress
-        cached_partial = cache_mod.load_address_trace_partial(address)
+        cached_partial = cache_mod.load_address_trace_partial(address, max_depth)
         if cached_partial is not None:
             cached_tx_limit = cached_partial.tx_limit
             needs_extend = (
@@ -781,13 +801,13 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
 
             if cached_partial.completed and not needs_extend:
                 # Full hit — load final v2 snapshot
-                cached = cache_mod.load_address_trace(address, tx_limit=effective_tx_limit)
+                cached = cache_mod.load_address_trace(address, tx_limit=effective_tx_limit, max_depth=max_depth)
                 if cached is not None:
-                    console.print("[green]Loaded address trace from cache[/green]")
+                    console.print("[green]Loaded from local cache[/green]")
                     result = cached
                     if dash and result.addresses:
                         from .graph.address_dash_app import start_address_server
-                        console.print("[green]Starting Address Interaction Dash graph...[/green]")
+                        console.print("[green]Starting graph visualization...[/green]")
                         Timer(1.5, _open_browser).start()
                         start_address_server(result, target_address=address)
                     else:
@@ -795,41 +815,43 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
                         _print_address_nodes_table(result)
                         _print_address_interaction_edges(result)
                     return
-                # No v2 snapshot — rebuild from manifest steps
-                console.print("[green]Loaded from manifest, rebuilding...[/green]")
+                # No v2 snapshot — rebuild from manifest
+                cache_mod.finalize_address_trace(address, max_depth)
+                n_ok = len(cached_partial.processed)
+                n_fail = len(cached_partial.failed)
                 skip_tx_hashes = cached_partial.processed | cached_partial.failed
+                cached_tx_count = n_ok
+                if n_fail:
+                    console.print(f"[yellow]Cache: {n_ok} OK, {n_fail} failed — re-query[/yellow]")
+                else:
+                    console.print("[green]Cache: per-step manifest — rebuilding[/green]")
             else:
                 # Partial or needs extension — skip processed txs, query remainder
                 n_ok = len(cached_partial.processed)
                 n_fail = len(cached_partial.failed)
                 skip_tx_hashes = cached_partial.processed | cached_partial.failed
+                cached_tx_count = n_ok
 
                 if needs_extend:
                     msg = (
-                        f"[yellow]Cached: limit={cached_tx_limit or 'all'}, "
-                        f"now limit={effective_tx_limit or 'all'} — "
-                        f"extending ({n_ok} cached + {n_fail} failed)[/yellow]"
+                        f"[yellow]Cache: limit "
+                        f"{cached_tx_limit or 'all'} \u2192 {effective_tx_limit or 'all'}"
+                        f" — extending ({n_ok} cached + {n_fail} failed)[/yellow]"
                     )
                 elif n_fail:
-                    msg = (
-                        f"[yellow]Partial cache: {n_ok} OK, {n_fail} failed, "
-                        f"re-querying + extending[/yellow]"
-                    )
+                    msg = f"[yellow]Cache: {n_ok} OK, {n_fail} failed — re-query[/yellow]"
                 else:
-                    msg = (
-                        f"[yellow]Partial cache (interrupted): {n_ok} tx(s) cached, "
-                        f"resuming...[/yellow]"
-                    )
+                    msg = f"[yellow]Cache (interrupted): {n_ok} steps cached — resuming[/yellow]"
                 console.print(msg)
         else:
             # 2. Try legacy v2 snapshot (backward compat)
-            cached = cache_mod.load_address_trace(address, tx_limit=effective_tx_limit)
+            cached = cache_mod.load_address_trace(address, tx_limit=effective_tx_limit, max_depth=max_depth)
             if cached is not None:
-                console.print("[green]Loaded address trace from local cache[/green]")
+                console.print("[green]Loaded from local cache[/green]")
                 result = cached
                 if dash and result.addresses:
                     from .graph.address_dash_app import start_address_server
-                    console.print("[green]Starting Address Interaction Dash graph...[/green]")
+                    console.print("[green]Starting graph visualization...[/green]")
                     Timer(1.5, _open_browser).start()
                     start_address_server(result, target_address=address)
                 else:
@@ -837,8 +859,6 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
                     _print_address_nodes_table(result)
                     _print_address_interaction_edges(result)
                 return
-            else:
-                console.print("[dim]No cached address trace found, running query...[/dim]")
 
     provider_name = _resolve_provider_name(provider, cfg)
     prov = _build_providers(
@@ -852,47 +872,106 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
 
     async def _runner():
         async with prov as p:
-            tx_total_msg = f"[dim]Examining up to {tx_limit} transactions[/dim]" if tx_limit else ""
-            if tx_total_msg:
-                console.print(tx_total_msg)
-            if skip_tx_hashes:
-                console.print(f"[dim]Skipping {len(skip_tx_hashes)} already-cached tx(s)[/dim]")
+            # Load store (identical to UTXO trace — _do_trace())
+            _store = None
+            _cached_nodes: dict[str, UTxONode] = {}
+            if not no_cache and cache_mod.STORE_FILE.exists():
+                _store = cache_mod.load_store_file()
+                _cached_nodes, _cached_inputs, _cached_outputs = cache_mod._store_to_models(_store)
+                if _cached_nodes:
+                    console.print(
+                        f"[dim]Store: {len(_cached_nodes)} cached nodes, "
+                        f"{sum(len(v) for v in _cached_inputs.values())} backward edges, "
+                        f"{sum(len(v) for v in _cached_outputs.values())} forward edges[/dim]"
+                    )
 
             # Per-step cache: save each tx's progress to manifest
-            def _step_callback(tx_hash: str, error: Optional[str]) -> None:
+            _processed_count = 0  # tracks live tx count (works for both batch + concurrent paths)
+            _manual_total: Optional[int] = None  # total from _progress callback
+
+            def _step_callback(source_address: str, tx_hash: str, error: Optional[str], depth: int) -> None:
+                nonlocal _processed_count, progress_task_id
+                _processed_count += 1
                 try:
                     cache_mod.save_address_trace_step(
                         address, tx_hash, error, [],
                         total_count=0, tx_limit=effective_tx_limit,
+                        max_depth=max_depth,
                     )
                 except Exception:
                     pass
 
+                # Progress bar: show current tx hash + depth + source (like UTXO trace)
+                short = tx_hash[:10] + "…" + tx_hash[-4:] if len(tx_hash) > 16 else tx_hash
+                err_mark = " [red]\u2717[/red]" if error else ""
+                pname = (
+                    getattr(p, 'current_provider', '')
+                    or getattr(p, 'provider_type', '')
+                    or ''
+                )
+                source_tag = f"[dim]{pname}[/dim]" if pname else "[red]?[/red]"
+                depth_tag = f"d={depth}" if max_depth > 1 else ""
+
+                desc = f"[cyan]address[/cyan]"
+                if depth_tag:
+                    desc += f" {depth_tag}"
+                desc += f" tx=#{_processed_count} {short}{err_mark} {source_tag}"
+
+                if progress_task_id is None:
+                    progress_task_id = progress.add_task(
+                        desc, total=_manual_total,
+                    )
+                else:
+                    progress.update(progress_task_id, description=desc)
+
             progress = Progress(
-                "[progress.description]{task.description}",
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
                 BarColumn(),
-                "[progress.percentage]{task.percentage:>3.0f}%",
+                TextColumn("{task.completed} tx"),
                 TimeElapsedColumn(),
                 console=console,
             )
             progress_task_id = None
 
             async def _progress(completed: int, total: int):
-                nonlocal progress_task_id
+                nonlocal progress_task_id, _manual_total
+                _manual_total = total
                 if progress_task_id is None:
                     progress_task_id = progress.add_task(
-                        f"Fetching {total} tx details...", total=total
+                        f"[cyan]address[/cyan] fetching txs...",
+                        total=total,
                     )
-                progress.update(progress_task_id, completed=completed)
+                else:
+                    # Concurrent path: update total from known value
+                    progress.update(progress_task_id, total=total, completed=completed)
 
             with progress:
-                return await trace_address_interactions(
+                result = await trace_address_interactions(
                     p, address,
+                    max_depth=max_depth,
                     tx_limit=tx_limit,
                     progress_callback=_progress,
-                    skip_tx_hashes=skip_tx_hashes or None,
+                    skip_tx_hashes={address: skip_tx_hashes} if skip_tx_hashes else None,
                     step_callback=_step_callback,
                 )
+
+            # End-of-run cached/live summary (identical to UTXO trace)
+            n_live = _processed_count  # works for both batch + concurrent paths
+            n_cached = cached_tx_count
+            if n_cached:
+                console.print(
+                    f"[dim]address: {n_cached} cached + "
+                    f"{n_live} new = {n_cached + n_live} tx(s)"
+                    f"{'' if not result.error else ', errors present'}[/dim]"
+                )
+            elif n_live:
+                console.print(
+                    f"[dim]address: {n_live} tx(s)"
+                    f"{'' if not result.error else ', errors present'}[/dim]"
+                )
+
+            return result
 
     try:
         result = asyncio.run(_runner())
@@ -908,8 +987,8 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
         # Only save v2 snapshot if we got actual data — don't overwrite
         # a good cache with an empty result (e.g. extension hit rate-limit).
         if result.edges:
-            cache_mod.save_address_trace(result, tx_limit=effective_tx_limit)
-            cache_mod.finalize_address_trace(address)
+            cache_mod.save_address_trace(result, tx_limit=effective_tx_limit, max_depth=max_depth)
+            cache_mod.finalize_address_trace(address, max_depth)
         else:
             logger.info(
                 "Skipping v2 snapshot save (no edges) — "
@@ -934,14 +1013,14 @@ def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_
 
     if dash and result.addresses:
         from .graph.address_dash_app import start_address_server
-        console.print("[green]Starting Address Interaction Dash graph...[/green]")
+        console.print("[green]Starting graph visualization...[/green]")
         Timer(1.5, _open_browser).start()
         start_address_server(result, target_address=address)
     else:
-        console.print("[green]Address trace complete. Use --dash to open interactive graph.[/green]")
+        console.print("[green]Trace complete — use --dash to view graph[/green]")
 
     if result.error:
-        err_console.print(f"[yellow]Warnings:[/yellow] {result.error}")
+        err_console.print(f"[yellow]\u26a0 Warnings: {result.error}[/yellow]")
 
 
 def _print_address_summary(result: AddressTraceResult) -> None:
