@@ -19,6 +19,7 @@ async def trace_forward(
     max_depth: int = 5,
     timeout_per_fetch: float = 15.0,
     cached_nodes: Optional[dict[str, UTxONode]] = None,
+    cached_outputs: Optional[dict[str, list[str]]] = None,
 ) -> AsyncGenerator[TraceStep, None]:
     """Async-generator that walks forward through spent outputs.
 

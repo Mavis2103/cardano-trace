@@ -149,6 +149,43 @@ class BlockfrostProvider(Provider):
         except Exception:
             return None
 
+    async def get_address_transactions(self, address: str) -> list[str]:
+        """Return all transaction hashes involving this address via Blockfrost.
+
+        Paginates through all pages to get complete transaction history.
+        """
+        all_hashes: set[str] = set()
+        page = 1
+        page_size = 100
+        max_pages = 500  # safety limit (50K tx — should be enough for any address)
+        try:
+            while page <= max_pages:
+                r = await self._client.get(
+                    f"/addresses/{address}/transactions",
+                    params={"order": "desc", "count": page_size, "page": page},
+                )
+                if r.status_code == 404:
+                    break
+                r.raise_for_status()
+                txs = r.json()
+                if not txs:
+                    break
+                new_hashes = {tx.get("tx_hash", "") for tx in txs if tx.get("tx_hash")}
+                if not new_hashes:
+                    break
+                all_hashes.update(new_hashes)
+                # If returned fewer than page_size, we're on the last page
+                if len(txs) < page_size:
+                    break
+                page += 1
+            return list(all_hashes)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise  # let fallback handle rate-limit
+            return list(all_hashes) if all_hashes else []
+        except Exception:
+            return list(all_hashes) if all_hashes else []
+
     async def get_spent_utxos(self, address: str) -> list[OutRef]:
         """Find transactions that spent UTXOs from this address (forward tracing).
 

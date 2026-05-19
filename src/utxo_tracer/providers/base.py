@@ -30,6 +30,30 @@ class Provider(ABC):
             f"{self.provider_type} does not support forward tracing"
         )
 
+    async def get_address_transactions(self, address: str) -> list[str]:
+        """Return all transaction hashes involving this address.
+
+        The address may appear as input, output, or both.
+        Override in providers that support it (Blockfrost, Koios, Kupmios).
+        """
+        raise NotImplementedError(
+            f"{self.provider_type} does not support address-tx lookup"
+        )
+
+    async def get_transactions_utxos(
+        self, tx_hashes: list[str]
+    ) -> list[dict]:
+        """Batch-fetch UTXO details for multiple transactions.
+
+        Default implementation falls back to sequential
+        ``get_transaction_utxos`` calls. Providers with batch APIs (Koios)
+        should override this for better performance.
+        """
+        results: list[dict] = []
+        for tx_hash in tx_hashes:
+            results.append(await self.get_transaction_utxos(tx_hash))
+        return results
+
     async def get_tx_block_time(self, tx_hash: str) -> int | None:
         """Return the block time (unix epoch) for a transaction, or None.
         

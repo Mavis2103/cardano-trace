@@ -163,7 +163,6 @@ class FallbackProvider(Provider):
             self.current_provider = name
             ok = await self._try_health(prov)
             if ok:
-                _warn(f"[green]✓ {name} is reachable[/green]")
                 return True
         return False
 
@@ -244,6 +243,44 @@ class FallbackProvider(Provider):
             raise NotImplementedError("get_spent_utxos not supported by any provider")
         # Some providers tried (and returned empty) or errored — return empty
         return []
+
+    async def get_address_transactions(self, address: str) -> list[str]:
+        not_implemented_count = 0
+        for prov in self._providers:
+            try:
+                txs = await asyncio.wait_for(
+                    self._retry(prov.get_address_transactions, address), timeout=10.0
+                )
+                if txs:
+                    return txs
+            except NotImplementedError:
+                not_implemented_count += 1
+                continue
+            except Exception:
+                continue
+        if not_implemented_count == len(self._providers):
+            raise NotImplementedError("get_address_transactions not supported by any provider")
+        return []
+
+    async def get_transactions_utxos(
+        self, tx_hashes: list[str]
+    ) -> list[dict]:
+        """Batch-fetch UTXO details, trying each provider in fallback order."""
+        not_implemented_count = 0
+        for prov in self._providers:
+            try:
+                return await asyncio.wait_for(
+                    self._retry(prov.get_transactions_utxos, tx_hashes),
+                    timeout=30.0,
+                )
+            except NotImplementedError:
+                not_implemented_count += 1
+                continue
+            except Exception:
+                continue
+        if not_implemented_count == len(self._providers):
+            raise NotImplementedError("get_transactions_utxos not supported by any provider")
+        return [{"inputs": [], "outputs": []} for _ in tx_hashes]
 
     async def aclose(self) -> None:
         for prov in self._providers:

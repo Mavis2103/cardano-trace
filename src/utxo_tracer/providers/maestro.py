@@ -24,7 +24,7 @@ class MaestroProvider(Provider):
         self.base_url = base_url.rstrip("/")
         headers: dict[str, str] = {"Accept": "application/json"}
         if api_key:
-            headers["x-api-key"] = api_key
+            headers["api-key"] = api_key
         self._client = httpx.AsyncClient(
             base_url=self.base_url, headers=headers, timeout=timeout
         )
@@ -136,3 +136,41 @@ class MaestroProvider(Provider):
         for o in tx.get("outputs", []) or []:
             outputs.append(self._parse_output(tx_hash, o))
         return {"inputs": inputs, "input_utxos": input_utxos, "outputs": outputs}
+
+    async def get_address_transactions(self, address: str) -> list[str]:
+        """Return all transaction hashes involving this address via Maestro.
+
+        Paginates through all pages to get complete transaction history.
+        """
+        all_hashes: set[str] = set()
+        page = 1
+        page_size = 100
+        max_pages = 500
+        try:
+            while page <= max_pages:
+                r = await self._client.get(
+                    f"/addresses/{address}/transactions",
+                    params={"count": page_size, "page": page},
+                )
+                if r.status_code == 404:
+                    break
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, dict) and "data" in data:
+                    data = data["data"]
+                if not isinstance(data, list) or not data:
+                    break
+                new_hashes = {tx.get("tx_hash", "") for tx in data if tx.get("tx_hash")}
+                if not new_hashes:
+                    break
+                all_hashes.update(new_hashes)
+                if len(data) < page_size:
+                    break
+                page += 1
+            return list(all_hashes)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise
+            return list(all_hashes) if all_hashes else []
+        except Exception:
+            return list(all_hashes) if all_hashes else []

@@ -1,0 +1,30 @@
+{
+  "caba2f78b6ec87a7_10": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 13,
+    "edges": 16,
+    "tx_limit": 10,
+    "created_at": 1779102534.9938824
+  },
+  "caba2f78b6ec87a7_20": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 26,
+    "edges": 32,
+    "tx_limit": 20,
+    "created_at": 1779102560.5130575
+  },
+  "caba2f78b6ec87a7_100": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 50,
+    "edges": 68,
+    "tx_limit": 100,
+    "created_at": 1779159467.271185
+  },
+  "caba2f78b6ec87a7_101": {
+    "target_address": "addr1qx7lzh4zew0pen6g6a327ax5qymjp8km67n",
+    "addresses": 45,
+    "edges": 59,
+    "tx_limit": 101,
+    "created_at": 1779159565.93842
+  }
+}

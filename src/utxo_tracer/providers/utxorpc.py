@@ -96,7 +96,13 @@ class UTxORPCProvider(Provider):
             if self._query_client is not None:
                 return self._query_client
 
-            from utxorpc.query import CardanoQueryClient
+            try:
+                from utxorpc.query import CardanoQueryClient
+            except ImportError as e:
+                raise CapabilityError(
+                    self.provider_type,
+                    f"SDK not available: {e}",
+                )
 
             self._query_client = CardanoQueryClient(
                 uri=self._uri,
@@ -118,7 +124,13 @@ class UTxORPCProvider(Provider):
             if self._sync_client is not None:
                 return self._sync_client
 
-            from utxorpc.sync import CardanoSyncClient
+            try:
+                from utxorpc.sync import CardanoSyncClient
+            except ImportError as e:
+                raise CapabilityError(
+                    self.provider_type,
+                    f"SDK not available: {e}",
+                )
 
             self._sync_client = CardanoSyncClient(
                 uri=self._uri,
@@ -338,7 +350,12 @@ class UTxORPCProvider(Provider):
     # ── Forward tracing ───────────────────────────────────────────────
 
     async def get_spent_utxos(self, address: str) -> list:
-        from utxorpc.v1alpha.query import query_pb2 as q_pb2
+        try:
+            from utxorpc.v1alpha.query import query_pb2 as q_pb2
+        except ImportError as e:
+            raise NotImplementedError(
+                f"UTxORPC SDK import failed: {e}"
+            ) from e
 
         qc = await self._get_query_client()
 
@@ -366,6 +383,23 @@ class UTxORPCProvider(Provider):
         except Exception as e:
             logger.debug("get_spent_utxos failed: %s", e)
             return []
+
+    async def get_address_transactions(self, address: str) -> list[str]:
+        """Return all transaction hashes involving this address via UTxORPC.
+
+        NOTE: async_search_utxos only finds the CURRENT UTXO set — it only
+        returns transactions where this address is a *receiver* (output owner),
+        completely missing transactions where this address is a spender (input).
+
+        Until DumpHistory-based block range scanning is implemented, raise
+        NotImplementedError so the fallback chain picks a provider with
+        proper address history (Koios, Blockfrost, etc.).
+        """
+        raise NotImplementedError(
+            "UtxoRPC get_address_transactions only finds current UTXOs "
+            "(receiver side only); falls back to Koios/Blockfrost for "
+            "complete address transaction history"
+        )
 
     # ── Parsing helpers ───────────────────────────────────────────────
 

@@ -52,20 +52,25 @@ class KupmiosProvider(Provider):
         await self._ogmios.aclose()
 
     async def health_check(self) -> bool:
+        """Check if Kupo is reachable (essential for all reads).
+
+        Ogmios is checked via GET /health for connectivity but does NOT
+        block the health result — Kupo alone is sufficient for forward
+        tracing, address tracing, and single UTXO lookups.
+        Ogmios is only needed for backward tracing (get_transaction_utxos).
+        """
         try:
             r1 = await self._kupo.get("/health")
             kupo_ok = r1.status_code in (200, 204)
         except Exception:
             kupo_ok = False
+        # Ogmios: use lightweight GET /health (not JSON-RPC)
         try:
-            r2 = await self._ogmios.post(
-                "/",
-                json={"jsonrpc": "2.0", "method": "queryNetwork/tip", "params": {}},
-            )
-            ogmios_ok = r2.status_code == 200
+            r2 = await self._ogmios.get("/health")
+            self._ogmios_ok = r2.status_code == 200
         except Exception:
-            ogmios_ok = False
-        return kupo_ok and ogmios_ok
+            self._ogmios_ok = False
+        return kupo_ok
 
     def _parse_kupo_match(self, m: dict) -> UTxONode:
         tx_hash = m.get("transaction_id", "")
@@ -171,6 +176,28 @@ class KupmiosProvider(Provider):
         outputs = await self._get_all_outputs_for_tx(tx_hash)
         inputs = await self._get_inputs_for_tx(tx_hash)
         return {"inputs": inputs, "outputs": outputs}
+
+    async def get_address_transactions(self, address: str) -> list[str]:
+        """Return all transaction hashes involving this address via Kupo."""
+        try:
+            r = await self._kupo.get(f"/matches/{address}")
+            if r.status_code == 404:
+                return []
+            r.raise_for_status()
+            data = r.json()
+            tx_hashes: set[str] = set()
+            if isinstance(data, list):
+                for m in data:
+                    created = m.get("created_at") or {}
+                    if created.get("transaction_id"):
+                        tx_hashes.add(created["transaction_id"])
+                    spent = m.get("spent_at") or {}
+                    if spent.get("transaction_id"):
+                        tx_hashes.add(spent["transaction_id"])
+            return list(tx_hashes)
+        except Exception as e:
+            logger.debug("get_address_transactions failed for %s: %s", address[:20], e)
+            return []
 
     async def get_spent_utxos(self, address: str) -> list[OutRef]:
         try:

@@ -89,6 +89,49 @@ class TraceStep:
 
 
 @dataclass
+class AddressInteractionNode:
+    """An address node in the address-interaction graph."""
+    address: str
+    address_type: str = "unknown"
+    total_ada: float = 0.0
+    net_ada: float = 0.0
+    total_incoming_ada: float = 0.0
+    total_outgoing_ada: float = 0.0
+    tx_count: int = 0
+    is_cex: bool = False
+    cex_name: str = ""
+    is_target: bool = False
+
+
+@dataclass
+class AddressInteractionEdge:
+    """Connection between two addresses through a shared transaction.
+
+    direction_relative_to_target:
+        ``"incoming"`` — target received funds from source
+        ``"outgoing"`` — target sent funds to source
+        ``"both"`` — transactions exist in both directions
+        ``"unknown"`` — direction could not be determined
+    """
+    source: str
+    target: str
+    tx_hashes: list[str] = field(default_factory=list)
+    interaction_count: int = 0
+    direction_relative_to_target: str = "unknown"
+
+
+@dataclass
+class AddressTraceResult:
+    """Result of an address-interaction trace."""
+    target_address: str
+    addresses: list[AddressInteractionNode]
+    edges: list[AddressInteractionEdge]
+    total_transactions: int = 0
+    error: Optional[str] = None
+    provider_name: str = ""
+
+
+@dataclass
 class CexInfo:
     name: str
     type: str = "exchange"

@@ -121,30 +121,75 @@ class KoiosProvider(Provider):
                     len(arr),
                     tx_hash,
                 )
-            tx = arr[0]
-            inputs: list[OutRef] = []
-            input_utxos: dict[str, UTxONode] = {}
-            for i in tx.get("inputs", []) or []:
-                th = i.get("tx_hash") or (i.get("out_ref") or {}).get("tx_hash")
-                ti = i.get("tx_index")
-                if ti is None:
-                    ti = (i.get("out_ref") or {}).get("tx_index", 0)
-                if th is not None:
-                    out_ref = OutRef(tx_hash=th, output_index=int(ti or 0))
-                    inputs.append(out_ref)
-                    # Koios tx_info returns full input details — cache the UTXO
-                    utxo = self._parse_utxo(i)
-                    input_utxos[out_ref.node_id()] = utxo
-
-            outputs: list[UTxONode] = []
-            for o in tx.get("outputs", []) or []:
-                # ensure tx_hash present
-                if not o.get("tx_hash"):
-                    o = {**o, "tx_hash": tx_hash}
-                outputs.append(self._parse_utxo(o))
-            return {"inputs": inputs, "input_utxos": input_utxos, "outputs": outputs}
+            return self._parse_tx_info(arr[0], tx_hash)
         except Exception:
             return {"inputs": [], "outputs": []}
+
+    async def get_transactions_utxos(
+        self, tx_hashes: list[str]
+    ) -> list[dict]:
+        """Batch-fetch UTXO details for multiple transactions via Koios /tx_info.
+
+        Sends up to 100 tx hashes in a single POST request.
+        Falls back to sequential calls for empty/unexpected responses.
+        """
+        if not tx_hashes:
+            return []
+
+        try:
+            body = {"_tx_hashes": tx_hashes}
+            r = await self._client.post("/tx_info", json=body)
+            if r.status_code == 404:
+                return [{"inputs": [], "outputs": []} for _ in tx_hashes]
+            r.raise_for_status()
+            arr = r.json()
+            if not arr:
+                return [{"inputs": [], "outputs": []} for _ in tx_hashes]
+        except Exception:
+            # Fall back to parent sequential per-tx fetching
+            return await super().get_transactions_utxos(tx_hashes)
+
+        # Build lookup from returned data
+        tx_map: dict[str, dict] = {}
+        for tx_data in arr:
+            th = tx_data.get("tx_hash")
+            if not th:
+                outputs = tx_data.get("outputs")
+                if outputs and len(outputs) > 0:
+                    th = outputs[0].get("tx_hash")
+            if th:
+                tx_map[th] = tx_data
+
+        results: list[dict] = []
+        for tx_hash in tx_hashes:
+            if tx_hash in tx_map:
+                results.append(self._parse_tx_info(tx_map[tx_hash], tx_hash))
+            else:
+                results.append({"inputs": [], "outputs": []})
+        return results
+
+    def _parse_tx_info(self, tx: dict, tx_hash: str) -> dict:
+        """Parse a single tx_info response into standard format."""
+        inputs: list[OutRef] = []
+        input_utxos: dict[str, UTxONode] = {}
+        for i in tx.get("inputs", []) or []:
+            th = i.get("tx_hash") or (i.get("out_ref") or {}).get("tx_hash")
+            ti = i.get("tx_index")
+            if ti is None:
+                ti = (i.get("out_ref") or {}).get("tx_index", 0)
+            if th is not None:
+                out_ref = OutRef(tx_hash=th, output_index=int(ti or 0))
+                inputs.append(out_ref)
+                utxo = self._parse_utxo(i)
+                input_utxos[out_ref.node_id()] = utxo
+
+        outputs: list[UTxONode] = []
+        for o in tx.get("outputs", []) or []:
+            if not o.get("tx_hash"):
+                o = {**o, "tx_hash": tx_hash}
+            outputs.append(self._parse_utxo(o))
+
+        return {"inputs": inputs, "input_utxos": input_utxos, "outputs": outputs}
 
     async def get_tx_block_time(self, tx_hash: str) -> int | None:
         """Fetch block time for a transaction from Koios."""
@@ -160,6 +205,19 @@ class KoiosProvider(Provider):
             return arr[0].get("block_time")
         except Exception:
             return None
+
+    async def get_address_transactions(self, address: str) -> list[str]:
+        """Return all transaction hashes involving this address via Koios."""
+        try:
+            body = {"_addresses": [address]}
+            r = await self._client.post("/address_txs", json=body)
+            if r.status_code == 404:
+                return []
+            r.raise_for_status()
+            txs = r.json()
+            return list({tx.get("tx_hash", "") for tx in txs if tx.get("tx_hash")})
+        except Exception:
+            return []
 
     async def get_spent_utxos(self, address: str) -> list[OutRef]:
         """Find transactions that spent UTXOs from this address (forward tracing).

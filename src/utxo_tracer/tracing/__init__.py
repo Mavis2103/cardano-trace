@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..models import TraceStep, TransactionEdge, UTxONode
+from .address_interactions import trace_address_interactions
 from .backward import trace_backward
 from .forward import trace_forward
 

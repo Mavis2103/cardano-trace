@@ -11,8 +11,9 @@ _registry: dict[str, CexInfo] = {}
 
 # Seed with well-known Cardano exchange addresses (extend as needed).
 KNOWN_CEX: dict[str, CexInfo] = {
-    # Binance (Cardano staking pool / known hot wallets) — illustrative entries only.
-    "addr1q9p4yvxny5p4qf3ay4qrjxn6r6r0a2y8m4f0wlrqxmqcw2du5l3p3v5z4q3xy0y2c9y9pkjqdvk4z9zh4myxh0a5sgsr5rh3v": CexInfo(name="Binance", type="exchange", confidence="medium"),
+    # Binance hot wallet — CEX→Cardano: sends FROM this address TO user directly.
+    #               Cardano→CEX: user → intermediary → this address (consolidation).
+    "addr1vx7j284mqe59w2mka36gf5xq0hvu8ms2989553fk5qh3prcapfpj3": CexInfo(name="Binance", type="exchange", confidence="high"),
 }
 
 # initialize live registry with seeded data

@@ -122,7 +122,7 @@ def _build_providers(
             use_proxy=use_proxy, proxy_url=proxy_url, overrides=overrides,
         )
 
-    _FALLBACK_ORDER = ["utxorpc", "blockfrost", "koios", "maestro"]
+    _FALLBACK_ORDER = ["blockfrost", "koios", "maestro", "utxorpc"]
     order = _FALLBACK_ORDER[:]
     if name in order:
         order.remove(name)
@@ -387,8 +387,10 @@ async def _run_trace(
     task_id,
     cached_nodes: Optional[dict[str, UTxONode]] = None,
     cached_inputs: Optional[dict[str, list[str]]] = None,
+    cached_outputs: Optional[dict[str, list[str]]] = None,
     store: Optional[dict] = None,
     store_module=None,
+    trace_key: str = "",
 ) -> tuple[list[TraceStep], Optional[str], int]:
     steps: list[TraceStep] = []
     err: Optional[str] = None
@@ -396,7 +398,9 @@ async def _run_trace(
     errors_found = 0
     try:
         if direction == "forward":
-            gen = trace_forward(provider, start, max_depth=max_depth, cached_nodes=cached_nodes)
+            gen = trace_forward(provider, start, max_depth=max_depth,
+                                cached_nodes=cached_nodes,
+                                cached_outputs=cached_outputs)
         else:
             gen = trace_backward(provider, start, max_depth=max_depth,
                                   cached_nodes=cached_nodes, cached_inputs=cached_inputs)
@@ -404,20 +408,55 @@ async def _run_trace(
             steps.append(step)
             if step.utxo:
                 nodes_found += 1
-                if store is not None and store_module is not None:
-                    store_module.add_node_to_store(step.utxo, store)
-                    if step.parent_out_ref:
-                        store_module.add_input_to_store(
-                            step.parent_out_ref.node_id(), step.out_ref.node_id(), store,
-                        )
             if step.error:
                 errors_found += 1
-            if store is not None and store_module is not None:
-                n = len(steps)
-                if n == 1 or (n > 0 and n % 5 == 0):
-                    store_module.save_store_file(store)
+
+            # Check if this step was served from cache
+            is_cached = bool(
+                cached_nodes
+                and step.utxo
+                and step.out_ref.node_id() in cached_nodes
+            )
+            source_tag = "[dim](cached)[/dim]" if is_cached else getattr(provider, 'current_provider', '') or ''
+
+            # Per-step cache: save immediately (even failed steps)
+            if store is not None and store_module is not None and trace_key:
+                store_module.save_trace_step(
+                    trace_key,
+                    step.out_ref.node_id(),
+                    step.depth,
+                    step.error,
+                    step.parent_out_ref.node_id() if step.parent_out_ref else None,
+                    step.utxo,
+                    store,
+                    start=f"{start.tx_hash}#{start.output_index}",
+                    direction=direction,
+                )
+                if step.utxo and step.parent_out_ref:
+                    store_module.add_edge_to_store(
+                        step.out_ref.node_id(), step.parent_out_ref.node_id(),
+                        direction, store,
+                    )
+
             progress.update(task_id, advance=1,
-                description=f"[cyan]{direction}[/cyan] depth={step.depth} nodes={nodes_found} errors={errors_found} [dim]{getattr(provider, 'current_provider', '') or ''}[/dim]")
+                description=f"[cyan]{direction}[/cyan] depth={step.depth} nodes={nodes_found} errors={errors_found} {source_tag}")
+        # Summary: count cached vs live
+        _cached_count = sum(
+            1 for s in steps
+            if s.utxo and cached_nodes and s.out_ref.node_id() in cached_nodes
+        )
+        _live_count = nodes_found - _cached_count
+        if _cached_count:
+            console.print(
+                f"[dim]{direction}: {_cached_count} cached + "
+                f"{_live_count} new = {nodes_found} nodes, "
+                f"{errors_found} errors[/dim]"
+            )
+        elif nodes_found:
+            console.print(
+                f"[dim]{direction}: {nodes_found} nodes, "
+                f"{errors_found} errors[/dim]"
+            )
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     return steps, err, errors_found
@@ -426,14 +465,21 @@ async def _run_trace(
 async def _do_trace(
     provider: Provider, start: OutRef, direction: str, max_depth: int,
     skip_store: bool = False,
+    trace_key: str = "",
 ) -> TraceResult:
     from . import cache as _cache_mod
     if not skip_store and _cache_mod.STORE_FILE.exists():
         store = _cache_mod.load_store_file()
-        _cached_nodes, _cached_inputs = _cache_mod._store_to_models(store)
+        _cached_nodes, _cached_inputs, _cached_outputs = _cache_mod._store_to_models(store)
+        if _cached_nodes:
+            console.print(
+                f"[dim]Store: {len(_cached_nodes)} cached nodes, "
+                f"{sum(len(v) for v in _cached_inputs.values())} backward edges, "
+                f"{sum(len(v) for v in _cached_outputs.values())} forward edges[/dim]"
+            )
     else:
         store = None
-        _cached_nodes, _cached_inputs = {}, {}
+        _cached_nodes, _cached_inputs, _cached_outputs = {}, {}, {}
     with Progress(
         SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
         TextColumn("{task.completed} steps"), TimeElapsedColumn(),
@@ -447,7 +493,8 @@ async def _do_trace(
             bsteps, berr, berrors = await _run_trace(
                 provider, start, "backward", max_depth, progress, task,
                 cached_nodes=_cached_nodes, cached_inputs=_cached_inputs,
-                store=store, store_module=_cache_mod,
+                cached_outputs=_cached_outputs,
+                store=store, store_module=_cache_mod, trace_key=trace_key,
             )
             all_steps.extend(bsteps)
             err = berr
@@ -458,7 +505,8 @@ async def _do_trace(
             task = progress.add_task(f"[cyan]forward[/cyan] tracing... [dim]{pname}[/dim]", total=None)
             fsteps, ferr, _ferrors = await _run_trace(
                 provider, start, "forward", max_depth, progress, task,
-                cached_nodes=_cached_nodes, store=store, store_module=_cache_mod,
+                cached_nodes=_cached_nodes, cached_outputs=_cached_outputs,
+                store=store, store_module=_cache_mod, trace_key=trace_key,
             )
             all_steps.extend(fsteps)
             if ferr:
@@ -485,6 +533,9 @@ async def _do_trace(
                 "node_id": n.id, "address": n.address, "name": cex.name,
                 "type": cex.type, "confidence": cex.confidence, "ada": round(n.ada, 6),
             })
+    if trace_key:
+        from . import cache as _cache_mod
+        _cache_mod.finalize_trace(trace_key)
     return TraceResult(
         nodes=nodes, edges=edges, traced_path=traced_path,
         start_out_ref=start, direction=direction, max_depth=max_depth,
@@ -495,11 +546,22 @@ _MAIN_HELP = """\
 Cardano UTXO chain tracer — trace funds through Cardano blockchain.
 
 PROVIDERS
-  blockfrost   Blockfrost API (mainnet/testnet). Backward tracing only.
-  koios        Koios public API. Backward tracing only.
-  maestro      Maestro API. Backward tracing only.
-  kupmios      Kupo + Ogmios (local node). Supports both directions.
-  utxorpc      UTxORPC gRPC.
+  blockfrost   Blockfrost API (mainnet/testnet). Backward + forward + address.
+  koios        Koios public API. Backward + forward + address.
+  maestro      Maestro API. Backward + address (no forward).
+  kupmios      Kupo + Ogmios (self-hosted). Backward + forward + address.
+  utxorpc      UTxORPC gRPC. Backward only (forward depends on DumpHistory).
+
+  Backward = trace UTXO inputs (cash-in side).
+  Forward  = trace UTXO spends (cash-out side).
+  Address  = trace address interactions (all addresses that shared a tx).
+
+MULTI-KEY (rate-limit avoidance)
+  Pass multiple API keys comma-separated: --api-key key1,key2,key3
+  Auto-rotates on HTTP 429. Supported for: blockfrost, koios, maestro.
+  Kupmios also supports comma-separated --kupo-url / --ogmios-url
+    for multi-instance rotation (e.g. multiple Kupo+Ogmios pairs).
+  UTxORPC rate-limit depends on endpoint (Demeter.run, self-hosted, etc.).
 
 FALLBACK
   --fallback (on)   tries primary, then utxorpc -> blockfrost -> koios -> maestro
@@ -562,17 +624,45 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
         start = parse_out_ref(utxo)
     except ValueError as e:
         _fatal(str(e))
+
+    trace_key = ""
     if not no_cache:
-        cached_result = cache_mod.load_trace(start, direction, max_depth)
-        if cached_result is not None:
-            if getattr(cached_result, "errors_count", 0) > 0:
-                console.print("[yellow]Cached trace had errors — re-tracing missing UTXOs[/yellow]")
-            else:
-                console.print("[green]Loaded from local cache[/green]")
-                from .graph.dash_app import start_server
-                ck = cache_mod._cache_key(start, direction, max_depth)
-                start_server(cached_result, start_out_ref=start, cache_key=ck)
-                return
+        # 1. Try partial cache (per-step manifest, depth-adaptive)
+        cached_partial = cache_mod.load_trace_partial(start, direction, max_depth)
+        if cached_partial is not None:
+            if cached_partial.completed and not cached_partial.failed_nodes:
+                if cached_partial.cached_max_depth >= max_depth:
+                    # Full hit via per-step cache — use v2 snapshot if available
+                    cached_result = cache_mod.load_trace(start, direction, max_depth)
+                    if cached_result is not None:
+                        console.print("[green]Loaded from local cache[/green]")
+                        from .graph.dash_app import start_server
+                        ck = cache_mod._cache_key(start, direction, max_depth)
+                        start_server(cached_result, start_out_ref=start, cache_key=ck)
+                        return
+                    # No v2 snapshot (e.g. old manifest from interrupted trace) — rebuild
+                    console.print("[green]Loaded from per-step cache[/green]")
+
+            if cached_partial.failed_nodes:
+                console.print(f"[yellow]Partial cache: {len(cached_partial.cached_steps)} steps OK, "
+                              f"{len(cached_partial.failed_nodes)} to re-query"
+                              f"{', depth ' + str(cached_partial.cached_max_depth) + ' → ' + str(max_depth) if cached_partial.cached_max_depth < max_depth else ''}[/yellow]")
+            elif cached_partial.cached_max_depth < max_depth:
+                console.print(f"[yellow]Partial cache: depth {cached_partial.cached_max_depth} → {max_depth}, extending[/yellow]")
+        else:
+            # 2. Try v2 snapshot (backward compat)
+            cached_result = cache_mod.load_trace(start, direction, max_depth)
+            if cached_result is not None:
+                if getattr(cached_result, "errors_count", 0) > 0:
+                    console.print("[yellow]Cached trace had errors — re-tracing missing UTXOs[/yellow]")
+                else:
+                    console.print("[green]Loaded from local cache[/green]")
+                    from .graph.dash_app import start_server
+                    ck = cache_mod._cache_key(start, direction, max_depth)
+                    start_server(cached_result, start_out_ref=start, cache_key=ck)
+                    return
+
+    trace_key = cache_mod._cache_key(start, direction, max_depth)
     provider_name = _resolve_provider_name(provider, cfg)
     if direction in ("forward", "both") and provider_name not in ("kupmios", "blockfrost", "koios"):
         _fatal(f"Forward tracing requires --provider kupmios, blockfrost, or koios (got '{provider_name}').")
@@ -585,7 +675,7 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
 
     async def _runner() -> TraceResult:
         async with prov as p:
-            return await _do_trace(p, start, direction, max_depth, skip_store=no_cache)
+            return await _do_trace(p, start, direction, max_depth, skip_store=no_cache, trace_key=trace_key)
 
     try:
         result = asyncio.run(_runner())
@@ -629,6 +719,422 @@ def trace_cmd(utxo, provider, api_key, base_url, auth_type, endpoint_url,
     if result.error:
         err_console.print(f"[red]Trace ended with error:[/red] {result.error}")
         sys.exit(2)
+
+
+# ── trace-address command ──────────────────────────────────────
+
+
+@main.command("trace-address", help="Trace all addresses that have interacted with a given Cardano address. Supports multiple API keys by comma-separating: --api-key key1,key2,key3")
+@click.argument("address", type=str)
+@click.option("--provider", type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]), default=None)
+@click.option("--api-key", type=str, default=None)
+@click.option("--base-url", type=str, default=None)
+@click.option("--auth-type", type=click.Choice(["project_id", "bearer", "dmtr-api-key"]), default=None)
+@click.option("--endpoint-url", type=str, default=None)
+@click.option("--kupo-url", type=str, default=None)
+@click.option("--ogmios-url", type=str, default=None)
+@click.option("--tx-limit", type=int, default=None, help="Optional cap on transactions to examine. Default: no limit (fetch all pages).")
+@click.option("--output", type=click.Choice(["table", "json", "csv"]), default="table")
+@click.option("--export-json", type=click.Path(dir_okay=False), default=None)
+@click.option("--export-csv", type=click.Path(), default=None)
+@click.option("--fallback/--no-fallback", default=True)
+@click.option("--cex-file", type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option("--dash/--no-dash", default=True, hidden=True)
+@click.option("--use-proxy/--no-proxy", default=False)
+@click.option("--proxy-url", type=str, default="http://localhost:3001")
+@click.option("--no-cache", is_flag=True, default=False, help="Skip local cache; always query providers.")
+def trace_address_cmd(address, provider, api_key, base_url, auth_type, endpoint_url,
+                       kupo_url, ogmios_url, tx_limit, output,
+                       export_json, export_csv, fallback, cex_file,
+                       dash, use_proxy, proxy_url, no_cache):
+    """Trace all addresses that have interacted with the given address.
+
+    Examines ALL transactions involving the address (or --tx-limit if set),
+    then builds a directed interaction graph showing connected addresses,
+    fund flow direction, and net ADA values.
+    """
+    cfg = load_config()
+    if cex_file:
+        try:
+            count = load_cex_from_file(cex_file)
+            console.print(f"[green]Loaded {count} CEX entries from {cex_file}[/green]")
+        except Exception as e:
+            err_console.print(f"[yellow]Warning loading CEX file:[/yellow] {e}")
+
+    # --- cache check (manifest + v2 snapshot, like UTXO trace) ---
+    skip_tx_hashes: set[str] = set()
+    # Normalize tx_limit: None (not specified) → 0 (all transactions)
+    effective_tx_limit = tx_limit if tx_limit is not None else 0
+
+    if not no_cache:
+        # 1. Try manifest for partial progress
+        cached_partial = cache_mod.load_address_trace_partial(address)
+        if cached_partial is not None:
+            cached_tx_limit = cached_partial.tx_limit
+            needs_extend = (
+                # User wants ALL but cache only covered some txs
+                (effective_tx_limit == 0 and cached_tx_limit != 0)
+                or
+                # User wants MORE than cache covered
+                (effective_tx_limit > cached_tx_limit > 0)
+            )
+
+            if cached_partial.completed and not needs_extend:
+                # Full hit — load final v2 snapshot
+                cached = cache_mod.load_address_trace(address, tx_limit=effective_tx_limit)
+                if cached is not None:
+                    console.print("[green]Loaded address trace from cache[/green]")
+                    result = cached
+                    if dash and result.addresses:
+                        from .graph.address_dash_app import start_address_server
+                        console.print("[green]Starting Address Interaction Dash graph...[/green]")
+                        Timer(1.5, _open_browser).start()
+                        start_address_server(result, target_address=address)
+                    else:
+                        _print_address_summary(result)
+                        _print_address_nodes_table(result)
+                        _print_address_interaction_edges(result)
+                    return
+                # No v2 snapshot — rebuild from manifest steps
+                console.print("[green]Loaded from manifest, rebuilding...[/green]")
+                skip_tx_hashes = cached_partial.processed | cached_partial.failed
+            else:
+                # Partial or needs extension — skip processed txs, query remainder
+                n_ok = len(cached_partial.processed)
+                n_fail = len(cached_partial.failed)
+                skip_tx_hashes = cached_partial.processed | cached_partial.failed
+
+                if needs_extend:
+                    msg = (
+                        f"[yellow]Cached: limit={cached_tx_limit or 'all'}, "
+                        f"now limit={effective_tx_limit or 'all'} — "
+                        f"extending ({n_ok} cached + {n_fail} failed)[/yellow]"
+                    )
+                elif n_fail:
+                    msg = (
+                        f"[yellow]Partial cache: {n_ok} OK, {n_fail} failed, "
+                        f"re-querying + extending[/yellow]"
+                    )
+                else:
+                    msg = (
+                        f"[yellow]Partial cache (interrupted): {n_ok} tx(s) cached, "
+                        f"resuming...[/yellow]"
+                    )
+                console.print(msg)
+        else:
+            # 2. Try legacy v2 snapshot (backward compat)
+            cached = cache_mod.load_address_trace(address, tx_limit=effective_tx_limit)
+            if cached is not None:
+                console.print("[green]Loaded address trace from local cache[/green]")
+                result = cached
+                if dash and result.addresses:
+                    from .graph.address_dash_app import start_address_server
+                    console.print("[green]Starting Address Interaction Dash graph...[/green]")
+                    Timer(1.5, _open_browser).start()
+                    start_address_server(result, target_address=address)
+                else:
+                    _print_address_summary(result)
+                    _print_address_nodes_table(result)
+                    _print_address_interaction_edges(result)
+                return
+            else:
+                console.print("[dim]No cached address trace found, running query...[/dim]")
+
+    provider_name = _resolve_provider_name(provider, cfg)
+    prov = _build_providers(
+        provider_name, cfg, use_fallback=fallback,
+        api_key=api_key, base_url=base_url, auth_type=auth_type,
+        endpoint_url=endpoint_url, kupo_url=kupo_url, ogmios_url=ogmios_url,
+        use_proxy=use_proxy, proxy_url=proxy_url,
+    )
+
+    from .tracing import trace_address_interactions
+
+    async def _runner():
+        async with prov as p:
+            tx_total_msg = f"[dim]Examining up to {tx_limit} transactions[/dim]" if tx_limit else ""
+            if tx_total_msg:
+                console.print(tx_total_msg)
+            if skip_tx_hashes:
+                console.print(f"[dim]Skipping {len(skip_tx_hashes)} already-cached tx(s)[/dim]")
+
+            # Per-step cache: save each tx's progress to manifest
+            def _step_callback(tx_hash: str, error: Optional[str]) -> None:
+                try:
+                    cache_mod.save_address_trace_step(
+                        address, tx_hash, error, [],
+                        total_count=0, tx_limit=effective_tx_limit,
+                    )
+                except Exception:
+                    pass
+
+            progress = Progress(
+                "[progress.description]{task.description}",
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                TimeElapsedColumn(),
+                console=console,
+            )
+            progress_task_id = None
+
+            async def _progress(completed: int, total: int):
+                nonlocal progress_task_id
+                if progress_task_id is None:
+                    progress_task_id = progress.add_task(
+                        f"Fetching {total} tx details...", total=total
+                    )
+                progress.update(progress_task_id, completed=completed)
+
+            with progress:
+                return await trace_address_interactions(
+                    p, address,
+                    tx_limit=tx_limit,
+                    progress_callback=_progress,
+                    skip_tx_hashes=skip_tx_hashes or None,
+                    step_callback=_step_callback,
+                )
+
+    try:
+        result = asyncio.run(_runner())
+    except RuntimeError as e:
+        if "event loop" in str(e).lower():
+            _fatal("Cannot run: already inside an event loop (Jupyter/pytest-asyncio). Use `await` instead.")
+        raise
+    except KeyboardInterrupt:
+        err_console.print("[yellow]Trace interrupted[/yellow]")
+        sys.exit(130)
+
+    if not no_cache:
+        # Only save v2 snapshot if we got actual data — don't overwrite
+        # a good cache with an empty result (e.g. extension hit rate-limit).
+        if result.edges:
+            cache_mod.save_address_trace(result, tx_limit=effective_tx_limit)
+            cache_mod.finalize_address_trace(address)
+        else:
+            logger.info(
+                "Skipping v2 snapshot save (no edges) — "
+                "manifest has %d processed tx(s)",
+                len(skip_tx_hashes) if skip_tx_hashes else 0,
+            )
+
+    if output == "json":
+        click.echo(jsonlib.dumps(_dataclass_to_dict(result), indent=2, default=str))
+    elif output == "csv":
+        _export_address_csv(result, export_csv or "./addr_trace_output")
+    else:
+        _print_address_summary(result)
+        _print_address_nodes_table(result)
+        _print_address_interaction_edges(result)
+
+    if export_json and output != "json":
+        _export_address_json(result, export_json)
+        console.print(f"[green]Exported JSON:[/green] {export_json}")
+    if export_csv and output != "csv":
+        _export_address_csv(result, export_csv)
+
+    if dash and result.addresses:
+        from .graph.address_dash_app import start_address_server
+        console.print("[green]Starting Address Interaction Dash graph...[/green]")
+        Timer(1.5, _open_browser).start()
+        start_address_server(result, target_address=address)
+    else:
+        console.print("[green]Address trace complete. Use --dash to open interactive graph.[/green]")
+
+    if result.error:
+        err_console.print(f"[yellow]Warnings:[/yellow] {result.error}")
+
+
+def _print_address_summary(result: AddressTraceResult) -> None:
+    from .models import AddressTraceResult
+    n_cex = sum(1 for n in result.addresses if n.is_cex)
+    net_flow = sum(n.net_ada for n in result.addresses)
+    n_incoming = sum(1 for e in result.edges if e.direction_relative_to_target == "incoming")
+    n_outgoing = sum(1 for e in result.edges if e.direction_relative_to_target == "outgoing")
+    panel = Panel.fit(
+        "\n".join([
+            f"[bold]Target:[/bold] {shorten(result.target_address, 14, 8)}",
+            f"[bold]Transactions examined:[/bold] {result.total_transactions}",
+            f"[bold]Connected addresses:[/bold] {len(result.addresses)}",
+            f"[bold]Interactions (edges):[/bold] {len(result.edges)} "
+            f"([green]→{n_outgoing}[/green] [red]←{n_incoming}[/red] [dim]{len(result.edges)-n_incoming-n_outgoing} other[/dim])",
+            f"[bold]CEX hits:[/bold] {n_cex}",
+            f"[bold]Provider:[/bold] {result.provider_name or 'fallback'}",
+            f"[bold]Net ADA flow:[/bold] {net_flow:+,.6f}",
+        ]),
+        title="Address Interaction Summary", border_style="cyan",
+    )
+    console.print(panel)
+
+
+def _print_address_nodes_table(result: AddressTraceResult) -> None:
+    from .models import AddressTraceResult
+    addrs = result.addresses
+    n_total = len(addrs)
+    SHOW_TOP = 100 if n_total <= 150 else 50
+    show_addrs = addrs[:SHOW_TOP]
+    _TYPE_LABEL = {
+        "wallet": "[blue]W[/blue]",
+        "script": "[yellow]S[/yellow]",
+        "byron": "[magenta]B[/magenta]",
+        "stake": "[green]K[/green]",
+        "unknown": "[dim]?[/dim]",
+    }
+    table = Table(title=f"Connected Addresses ({n_total})"
+                  + ("" if n_total == len(show_addrs)
+                     else f" — showing top {SHOW_TOP}"),
+                  header_style="bold magenta")
+    table.add_column("", width=3)  # target indicator
+    table.add_column("Address", overflow="fold")
+    table.add_column("Type", justify="center")
+    table.add_column("TXs", justify="right")
+    table.add_column("In ADA", justify="right")
+    table.add_column("Out ADA", justify="right")
+    table.add_column("Net ADA", justify="right")
+    table.add_column("CEX")
+    for n in show_addrs:
+        addr = n.address
+        if n.is_target:
+            row_style = "bold cyan"
+            target_mark = "[★]"
+        elif n.is_cex:
+            row_style = "bold red"
+            target_mark = " "
+        elif abs(n.net_ada) >= 100:
+            row_style = "yellow"
+            target_mark = " "
+        else:
+            row_style = ""
+            target_mark = " "
+        type_display = _TYPE_LABEL.get(n.address_type, "[dim]?[/dim]")
+        cex_label = n.cex_name if n.is_cex else ""
+        net_label = (
+            f"[green]+{n.net_ada:,.0f}[/green]"
+            if n.net_ada > 0 else
+            f"[red]{n.net_ada:,.0f}[/red]"
+            if n.net_ada < 0 else
+            "[dim]0[/dim]"
+        )
+        table.add_row(
+            target_mark,
+            shorten(addr, 14, 8),
+            type_display,
+            str(n.tx_count),
+            f"{n.total_incoming_ada:,.0f}",
+            f"{n.total_outgoing_ada:,.0f}",
+            net_label,
+            cex_label if cex_label else "-",
+            style=row_style,
+        )
+    n_hidden = n_total - len(show_addrs)
+    if n_hidden > 0:
+        hidden_cex = sum(1 for n in addrs[SHOW_TOP:] if n.is_cex)
+        hidden_in = sum(n.total_incoming_ada for n in addrs[SHOW_TOP:])
+        hidden_out = sum(n.total_outgoing_ada for n in addrs[SHOW_TOP:])
+        table.add_row(
+            "", f"[dim]... {n_hidden} more[/dim]", "", "",
+            f"[dim]{hidden_in:,.0f}[/dim]",
+            f"[dim]{hidden_out:,.0f}[/dim]", "[dim]...[/dim]",
+            f"[dim]({hidden_cex} CEX)[/dim]", style="dim", end_section=True,
+        )
+    console.print(table)
+
+
+def _print_address_interaction_edges(result: AddressTraceResult) -> None:
+    from .models import AddressTraceResult
+    if not result.edges:
+        return
+    table = Table(title=f"Interactions ({len(result.edges)})",
+                  header_style="bold yellow")
+    table.add_column("#", justify="right")
+    table.add_column("Direction", justify="center", width=2)
+    table.add_column("Address A", overflow="fold")
+    table.add_column("Address B", overflow="fold")
+    table.add_column("Shared TXs", justify="right")
+    sorted_edges = sorted(result.edges, key=lambda e: e.interaction_count, reverse=True)
+    for i, e in enumerate(sorted_edges[:30]):
+        dir_label = {
+            "incoming": "[red]←[/red]",
+            "outgoing": "[green]→[/green]",
+            "both": "[yellow]↔[/yellow]",
+            "unknown": "[dim]?[/dim]",
+        }.get(e.direction_relative_to_target, "[dim]?[/dim]")
+        table.add_row(
+            str(i + 1),
+            dir_label,
+            shorten(e.source, 14, 8),
+            shorten(e.target, 14, 8),
+            str(e.interaction_count),
+        )
+    if len(sorted_edges) > 30:
+        table.add_row(
+            f"[dim]... {len(sorted_edges)-30} more[/dim]", "", "", "", "",
+            style="dim", end_section=True,
+        )
+    console.print(table)
+
+
+def _export_address_json(result: AddressTraceResult, path: str) -> None:
+    import json as _json
+    from .models import AddressTraceResult
+    payload = {
+        "target_address": result.target_address,
+        "total_transactions": result.total_transactions,
+        "addresses": [
+            {
+                "address": n.address,
+                "address_type": n.address_type,
+                "total_ada": n.total_ada,
+                "net_ada": n.net_ada,
+                "total_incoming_ada": n.total_incoming_ada,
+                "total_outgoing_ada": n.total_outgoing_ada,
+                "tx_count": n.tx_count,
+                "is_cex": n.is_cex,
+                "cex_name": n.cex_name,
+                "is_target": n.is_target,
+            }
+            for n in result.addresses
+        ],
+        "edges": [
+            {
+                "source": e.source,
+                "target": e.target,
+                "tx_hashes": e.tx_hashes,
+                "interaction_count": e.interaction_count,
+                "direction_relative_to_target": e.direction_relative_to_target,
+            }
+            for e in result.edges
+        ],
+        "error": result.error,
+        "provider_name": result.provider_name,
+    }
+    Path(path).write_text(_json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _export_address_csv(result: AddressTraceResult, base_path: str) -> tuple[str, str]:
+    import csv as _csvmodule
+    from .models import AddressTraceResult
+    base = Path(base_path)
+    if base.suffix.lower() == ".csv":
+        stem = base.with_suffix("")
+        nodes_path = str(stem) + "_addresses.csv"
+        edges_path = str(stem) + "_edges.csv"
+    else:
+        base.mkdir(parents=True, exist_ok=True)
+        nodes_path = str(base / "addresses.csv")
+        edges_path = str(base / "edges.csv")
+    with open(nodes_path, "w", newline="", encoding="utf-8") as f:
+        w = _csvmodule.writer(f)
+        w.writerow(["address", "type", "total_ada", "tx_count", "is_cex", "cex_name", "is_target"])
+        for n in result.addresses:
+            w.writerow([n.address, n.address_type, n.total_ada, n.tx_count, n.is_cex, n.cex_name, n.is_target])
+    with open(edges_path, "w", newline="", encoding="utf-8") as f:
+        w = _csvmodule.writer(f)
+        w.writerow(["source", "target", "interaction_count", "tx_hashes"])
+        for e in result.edges:
+            w.writerow([e.source, e.target, e.interaction_count, ";".join(e.tx_hashes)])
+    console.print(f"[green]Wrote addresses CSV:[/green] {nodes_path}")
+    console.print(f"[green]Wrote edges CSV:[/green] {edges_path}")
+    return nodes_path, edges_path
 
 
 @main.group("config", help="Manage stored configuration.")
@@ -684,7 +1190,7 @@ def config_clear() -> None:
         console.print("[yellow]No config file to clear.[/yellow]")
 
 
-@main.command("health", help="Check provider connectivity.")
+@main.command("health", help="Check provider connectivity. Without --provider, checks all configured providers.")
 @click.option("--provider", type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]), default=None)
 @click.option("--api-key", type=str, default=None)
 @click.option("--base-url", type=str, default=None)
@@ -698,21 +1204,217 @@ def config_clear() -> None:
 def health_cmd(provider, api_key, base_url, auth_type, endpoint_url,
                kupo_url, ogmios_url, fallback, use_proxy, proxy_url):
     cfg = load_config()
-    provider_name = _resolve_provider_name(provider, cfg)
-    prov = _build_providers(
-        provider_name, cfg, use_fallback=fallback,
-        api_key=api_key, base_url=base_url, auth_type=auth_type,
-        endpoint_url=endpoint_url, kupo_url=kupo_url, ogmios_url=ogmios_url,
-        use_proxy=use_proxy, proxy_url=proxy_url,
-    )
-    async def _check() -> bool:
-        async with prov as p:
-            return await p.health_check()
-    ok = asyncio.run(_check())
-    if ok:
-        console.print("[green]OK[/green] provider chain is reachable.")
-    else:
-        err_console.print("[red]FAIL[/red] provider chain is not reachable.")
+    overrides = {k: v for k, v in {
+        "api_key": api_key, "base_url": base_url, "auth_type": auth_type,
+        "endpoint_url": endpoint_url, "kupo_url": kupo_url, "ogmios_url": ogmios_url,
+    }.items() if v is not None}
+
+    if provider:
+        # ── Single provider mode ─────────────────────────────────
+        from .providers.rotating import RotatingKeyProvider
+        provider_name = provider
+        prov = _build_providers(
+            provider_name, cfg, use_fallback=fallback,
+            api_key=api_key, base_url=base_url, auth_type=auth_type,
+            endpoint_url=endpoint_url, kupo_url=kupo_url, ogmios_url=ogmios_url,
+            use_proxy=use_proxy, proxy_url=proxy_url,
+        )
+
+        # Multi-key: unwrap FallbackProvider (from --fallback) to check per-key health
+        from .providers.fallback import FallbackProvider
+        check_prov = prov
+        if isinstance(prov, FallbackProvider) and prov._providers:
+            check_prov = prov._providers[0]
+        if isinstance(check_prov, RotatingKeyProvider):
+            key_infos: list[str] = []
+            all_ok = True
+            for i, (kname, kinst) in enumerate(check_prov._instances):
+                async def _check_k(i=i, kinst=kinst):
+                    async with kinst as kp:
+                        return await kp.health_check()
+                k_ok = asyncio.run(_check_k())
+                label = f"k{i}" if kname.startswith(f"{provider_name}-") else kname
+                if k_ok:
+                    key_infos.append(f"[green]{label}:✓[/]")
+                else:
+                    key_infos.append(f"[red]{label}:✗[/]")
+                    all_ok = False
+            status = "[green]✓ OK[/green]" if all_ok else "[red]✗ FAIL[/red]"
+            console.print(f"{provider_name} ({len(key_infos)} keys): {' '.join(key_infos)}  {status}")
+            if not all_ok:
+                sys.exit(1)
+            return
+
+        async def _check_single():
+            async with prov as p:
+                return await p.health_check()
+        ok = asyncio.run(_check_single())
+        if ok:
+            provider_type = getattr(prov, "current_provider", "") or provider_name
+            primary_ok = (provider_type == provider_name
+                          or provider_type.startswith(f"{provider_name}:"))
+            if primary_ok or not fallback:
+                console.print(f"[green]✓ {provider_type} is reachable[/green]")
+                console.print("[green]OK[/green] provider is reachable.")
+            else:
+                console.print(f"[yellow]⚠ {provider_name} is not reachable[/yellow]")
+                console.print(f"[green]✓ Fallback {provider_type} is reachable[/green]")
+                console.print("[yellow]OK[/yellow] using fallback provider.")
+        else:
+            err_console.print(f"[red]✗ {provider_name} is not reachable[/red]")
+            sys.exit(1)
+        return
+
+    # ── All-providers mode ───────────────────────────────────────
+    _ALL_PROVIDERS = ["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]
+    from .providers import build_provider as _build_single
+
+    async def _check_one(pname: str) -> tuple[str, bool, str, str]:
+        """Check a single provider. Returns (name, ok, detail, error)."""
+        import httpx
+        from utxo_tracer.providers.blockfrost import BlockfrostProvider
+        from utxo_tracer.providers.koios import KoiosProvider
+        from utxo_tracer.providers.maestro import MaestroProvider
+        from utxo_tracer.providers.kupmios import KupmiosProvider
+        from utxo_tracer.providers.utxorpc import UTxORPCProvider
+        from utxo_tracer.providers.rotating import RotatingKeyProvider
+
+        try:
+            p_cfg = (cfg.get("providers") or {}).get(pname, {}) or {}
+            p = _build_single(pname, p_cfg, use_proxy=use_proxy,
+                              proxy_url=proxy_url, overrides=overrides)
+        except Exception as e:
+            msg = str(e).replace('\n', ' ').strip()[:80]
+            return (pname, False, pname, msg)
+
+        # ── Multi-key providers: check ALL keys ──────────────────────
+        if isinstance(p, RotatingKeyProvider):
+            keys_ok = 0
+            keys_total = len(p._instances)
+            key_results: list[tuple[str, bool]] = []
+            for kname, kinst in p._instances:
+                try:
+                    async with kinst as kp:
+                        k_ok = await kp.health_check()
+                except Exception:
+                    k_ok = False
+                if k_ok:
+                    keys_ok += 1
+                key_results.append((kname, k_ok))
+
+            all_ok = keys_ok == keys_total
+            detail = f"{pname} ({keys_ok}/{keys_total})"
+            key_labels = " ".join(
+                f"[{'green' if k_ok else 'red'}]{i}:{'✓' if k_ok else '✗'}[/]"
+                for i, (_kn, k_ok) in enumerate(key_results)
+            )
+
+            if all_ok:
+                return (pname, True, detail + " " + key_labels, "")
+            else:
+                fails = [f"key-{i}" for i, (_kn, k_ok) in enumerate(key_results) if not k_ok]
+                return (pname, False, detail, ", ".join(fails))
+
+        # ── Single-key / non-rotating providers ──────────────────────
+        real = p
+
+        async with p as prov:
+            try:
+                ok = await real.health_check()
+            except Exception as e:
+                msg = str(e).replace('\n', ' ').strip()[:80]
+                return (pname, False, pname, msg)
+
+            if ok:
+                detail = getattr(real, "current_provider", "") or pname
+                # Check Ogmios status if Kupmios
+                og_extra = ""
+                if isinstance(real, KupmiosProvider):
+                    og_ok = getattr(real, "_ogmios_ok", False)
+                    og_extra = " (Ogmios ✓)" if og_ok else " (Ogmios ✗)"
+                return (pname, True, detail + og_extra, "")
+
+            # health_check returned False — probe real HTTP client for the error
+            try:
+                if isinstance(real, BlockfrostProvider):
+                    r = await real._client.get("/blocks/latest")
+                    e_msg = f"HTTP {r.status_code}: {r.text[:60]}"
+                elif isinstance(real, KoiosProvider):
+                    r = await real._client.post("/tip", json={})
+                    e_msg = f"HTTP {r.status_code}: {r.text[:60]}"
+                elif isinstance(real, MaestroProvider):
+                    r = await real._client.get("/chain-tip")
+                    e_msg = f"HTTP {r.status_code}: {r.text[:60]}"
+                elif isinstance(real, KupmiosProvider):
+                    r = await real._kupo.get("/health")
+                    if r.status_code in (200, 204):
+                        # Kupo OK — check Ogmios via GET /health
+                        omsg = ""
+                        try:
+                            ro = await real._ogmios.get("/health")
+                            if ro.status_code != 200:
+                                omsg = f"HTTP {ro.status_code}"
+                        except Exception as oe:
+                            omsg = str(oe).replace('\n', ' ').strip()[:40]
+                        e_msg = f"Kupo OK, Ogmios fail: {omsg}" if omsg else ""
+                    else:
+                        e_msg = f"HTTP {r.status_code}: {r.text[:60]}"
+                elif isinstance(real, UTxORPCProvider):
+                    e_msg = "unreachable (gRPC)"
+                    # Try a simple connection test to get the actual error
+                    try:
+                        from utxorpc.query import CardanoQueryClient
+                        # Build the same URI the provider uses
+                        uri = getattr(real, "_uri", "")
+                        if uri:
+                            md = real._metadata()
+                            test_qc = CardanoQueryClient(uri=uri, metadata=md)
+                            await test_qc.async_connect().__aenter__()
+                            try:
+                                await asyncio.wait_for(test_qc.async_read_params(), timeout=5.0)
+                                e_msg = "SDK connected, but health_check failed"
+                            except asyncio.TimeoutError:
+                                e_msg = "gRPC timeout (5s)"
+                            except Exception as ge:
+                                e_msg = str(ge).replace('\n', ' ').strip()[:60]
+                            finally:
+                                await test_qc.async_connect().__aexit__(None, None, None)
+                    except Exception as ge:
+                        e_msg = str(ge).replace('\n', ' ').strip()[:60]
+                else:
+                    e_msg = "unreachable"
+            except httpx.ConnectError as ce:
+                e_msg = str(ce).replace('\n', ' ').strip()[:80]
+            except httpx.TimeoutException as te:
+                e_msg = str(te).replace('\n', ' ').strip()[:80]
+            except Exception as pe:
+                e_msg = str(pe).replace('\n', ' ').strip()[:80]
+
+            return (pname, False, pname, e_msg)
+
+    async def _run_all() -> list[tuple[str, bool, str, str]]:
+        return await asyncio.gather(*[_check_one(pn) for pn in _ALL_PROVIDERS])
+
+    results = asyncio.run(_run_all())
+
+    table = Table(title="Provider Health", header_style="bold cyan")
+    table.add_column("Provider", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Detail", overflow="fold")
+    table.add_column("Error", overflow="fold", max_width=40)
+
+    any_ok = False
+    for name, ok, detail, err in results:
+        if ok:
+            any_ok = True
+            table.add_row(name, "[green]✓ OK[/green]", detail, "[dim]—[/dim]")
+        else:
+            display_name = detail if detail != name else name
+            table.add_row(name, "[red]✗ FAIL[/red]", display_name, f"[red]{err[:50]}[/red]")
+    console.print(table)
+
+    if not any_ok:
+        err_console.print("[red]No providers are reachable.[/red]")
         sys.exit(1)
 
 
