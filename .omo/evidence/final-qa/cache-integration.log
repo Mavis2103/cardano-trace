@@ -1,0 +1,3 @@
+Cache integration test:
+Cache: 1 manifests, 712 steps
+PASS: cache.db present, manifest and step tables populated.

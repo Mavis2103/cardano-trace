@@ -1,0 +1,2 @@
+pytest full suite result: 44 passed, 0 failed, 0 errors
+Command: rtk pytest tests/ -v --tb=short

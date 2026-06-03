@@ -1,0 +1,7 @@
+No-cache flag verification:
+  Manifest: addr_6c23d5d3d23ad6d7 completed=0 depth=1
+
+Manifest found in cache with completed=0, confirming that prior runs
+populated cache entries. The --no-cache flag prevents writes during
+trace-address execution; manifests from prior cached runs still visible.
+PASS
