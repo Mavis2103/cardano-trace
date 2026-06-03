@@ -259,27 +259,42 @@ class FallbackProvider(Provider):
             except Exception:
                 continue
         if not_implemented_count == len(self._providers):
-            raise NotImplementedError("get_address_transactions not supported by any provider")
+            raise NotImplementedError(
+                "get_address_transactions not supported by any provider"
+            )
         return []
 
-    async def get_transactions_utxos(
-        self, tx_hashes: list[str]
-    ) -> list[dict]:
-        """Batch-fetch UTXO details, trying each provider in fallback order."""
+    async def get_transactions_utxos(self, tx_hashes: list[str]) -> list[dict]:
+        """Batch-fetch UTXO details.
+
+        Uses concurrent per‑tx calls (semaphore 10) so providers with
+        sequential single‑tx APIs still complete large batches fast.
+        """
         not_implemented_count = 0
         for prov in self._providers:
             try:
-                return await asyncio.wait_for(
-                    self._retry(prov.get_transactions_utxos, tx_hashes),
-                    timeout=30.0,
-                )
+                sem = asyncio.Semaphore(10)
+
+                async def _fetch(th: str) -> dict:
+                    async with sem:
+                        try:
+                            data = await self._try_get_tx(prov, th)
+                            return (
+                                data
+                                if data is not None
+                                else {"inputs": [], "outputs": []}
+                            )
+                        except Exception:
+                            return {"inputs": [], "outputs": []}
+
+                return list(await asyncio.gather(*[_fetch(th) for th in tx_hashes]))
             except NotImplementedError:
                 not_implemented_count += 1
                 continue
-            except Exception:
-                continue
         if not_implemented_count == len(self._providers):
-            raise NotImplementedError("get_transactions_utxos not supported by any provider")
+            raise NotImplementedError(
+                "get_transactions_utxos not supported by any provider"
+            )
         return [{"inputs": [], "outputs": []} for _ in tx_hashes]
 
     async def aclose(self) -> None:

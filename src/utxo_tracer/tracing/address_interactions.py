@@ -216,50 +216,55 @@ async def trace_address_interactions(
                 if step_callback:
                     step_callback(current_addr, tx_hash, None, current_depth)
 
-        # ── Try batch API first ──────────────────────────────────────────
+        # ── Try batch API — split into sub-batches ───────────────────────────
+        batch_idx = 0
+        chunk_size = max(20, _BATCH_SIZE)
         try:
-            batch_results = await asyncio.wait_for(
-                provider.get_transactions_utxos(tx_hashes),
-                timeout=timeout_per_fetch * (_BATCH_SIZE + 2),
-            )
-            for i, (tx_hash, tx_data) in enumerate(zip(tx_hashes, batch_results)):
-                # Cross-cache: save tx data so any trace type can reuse it
-                save_transaction(tx_hash, tx_data)
-                _process_tx_data_static(
-                    tx_hash,
-                    current_addr,
-                    current_depth,
-                    tx_data,
-                    all_edges,
-                    addr_tx_map,
-                    addr_net_ada,
-                    addr_gross_ada,
-                    addr_incoming_ada,
-                    addr_outgoing_ada,
-                    addr_type,
-                    addr_depth,
-                    queue,
-                    visited_addresses,
-                    max_depth,
-                    errors,
-                    discovered_utxos,
+            for chunk_start in range(0, len(tx_hashes), chunk_size):
+                chunk = tx_hashes[chunk_start : chunk_start + chunk_size]
+                batch_results = await asyncio.wait_for(
+                    provider.get_transactions_utxos(chunk),
+                    timeout=timeout_per_fetch * (len(chunk) + 2),
                 )
-                has_data = bool(tx_data.get("input_utxos") or tx_data.get("outputs"))
-                tx_err = None if has_data else "empty result"
-                if not has_data:
-                    errors.append(f"{current_addr[:16]}…: {tx_hash[:16]}…: {tx_err}")
-                if step_callback:
-                    step_callback(current_addr, tx_hash, tx_err, current_depth)
+                for offset, (tx_hash, tx_data) in enumerate(zip(chunk, batch_results)):
+                    global_idx = chunk_start + offset
+                    save_transaction(tx_hash, tx_data)
+                    _process_tx_data_static(
+                        tx_hash,
+                        current_addr,
+                        current_depth,
+                        tx_data,
+                        all_edges,
+                        addr_tx_map,
+                        addr_net_ada,
+                        addr_gross_ada,
+                        addr_incoming_ada,
+                        addr_outgoing_ada,
+                        addr_type,
+                        addr_depth,
+                        queue,
+                        visited_addresses,
+                        max_depth,
+                        errors,
+                        discovered_utxos,
+                    )
+                    has_data = bool(
+                        tx_data.get("input_utxos") or tx_data.get("outputs")
+                    )
+                    tx_err = None if has_data else "empty result"
+                    if not has_data:
+                        errors.append(
+                            f"{current_addr[:16]}…: {tx_hash[:16]}…: {tx_err}"
+                        )
+                    if step_callback:
+                        step_callback(current_addr, tx_hash, tx_err, current_depth)
 
-                # Yield to event loop periodically so pipe-bound readers can pick up
-                # progress output immediately (os.write → pipe buffer → parent reader
-                # blocks until we yield). Yield every 10 txs to balance responsiveness
-                # with throughput (yielding every tx is ~10% slower on large batches).
-                if i % 10 == 0:
-                    await asyncio.sleep(0)
+                    if global_idx % 10 == 0:
+                        await asyncio.sleep(0)
 
-                if progress_callback:
-                    await progress_callback(i + 1, effective_count)
+                    if progress_callback:
+                        await progress_callback(global_idx + 1, effective_count)
+                batch_idx += 1
         except (NotImplementedError, Exception) as exc:
             # Fall back to concurrent single-tx
             if not isinstance(exc, NotImplementedError):
