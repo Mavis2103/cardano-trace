@@ -1086,7 +1086,7 @@ def load_address_trace_partial(
         tx_limit=manifest_row["tx_limit"] or 0,
         max_depth=cached_max_depth,
         completed=bool(manifest_row["completed"]),
-        processed_by_addr=processed_by_addr if processed_by_addr else None,
+        processed_by_addr=processed_by_addr,
     )
 
 

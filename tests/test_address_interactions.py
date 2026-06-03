@@ -587,3 +587,121 @@ class TestMultiHopCacheReuse:
             f"Expected <= {calls_before} calls with skip_tx_hashes, "
             f"got {mock2.get_address_transactions.call_count}"
         )
+
+
+# ── B6: skip_tx_hashes applies to ALL addresses (not just target) ─────────
+
+
+@pytest.mark.asyncio
+async def test_skip_tx_hashes_multi_address(temp_cache):
+    """B6: skip_tx_hashes from cache covers all addresses, not just target.
+
+    Before fix: cli.py constructed skip_tx_hashes as {address: processed | failed}
+    covering only the target address. Counterparty txs at depth > 1 were never
+    skipped even if cached.
+
+    After fix: processed_by_addr from CachedAddrTrace covers ALL addresses,
+    so counterparty txs are properly skipped.
+    """
+    from utxo_tracer.tracing.address_interactions import trace_address_interactions
+
+    cache_mod = temp_cache
+
+    # Build depth-2 branching data: target → (target_0, target_1) → ...
+    # Each address at depth 0 and 1 has 1 tx.
+    tx_data = _build_branching_tx_data("target", depth=2)
+    mock = _make_mock_provider(tx_data)
+
+    # First trace: depth 2, all data fetched from provider
+    result1 = await trace_address_interactions(mock, "target", max_depth=2)
+    assert len(result1.addresses) > 0
+    # Save to cache with per-address step data
+    _save_trace_to_cache(cache_mod, "target", result1, max_depth=2)
+
+    # Load cache partial — verify processed_by_addr has BOTH addresses
+    cached_partial = load_address_trace_partial("target", max_depth=2)
+    assert cached_partial is not None, "Should find cached manifest"
+    assert cached_partial.processed_by_addr is not None, (
+        "processed_by_addr must be populated"
+    )
+
+    skip = cached_partial.processed_by_addr
+    # Collect all addresses present in the trace result
+    all_addrs = {node.address for node in result1.addresses}
+    # Every non-leaf address (with transactions) should have skip entries
+    for addr in all_addrs:
+        if addr in tx_data:
+            addr_tx_hashes = [t["tx_hash"] for t in tx_data[addr]]
+            if addr_tx_hashes:
+                assert addr in skip, (
+                    f"processed_by_addr missing entry for {addr[:30]}… — "
+                    f"only covers: {list(skip.keys())}"
+                )
+                for tx_hash in addr_tx_hashes:
+                    assert tx_hash in skip[addr], (
+                        f"processed_by_addr[{addr[:30]}…] missing tx {tx_hash}"
+                    )
+
+    # Second trace with skip_tx_hashes: ALL tx_hashes should be skipped
+    mock2 = _make_mock_provider(tx_data)
+    result2 = await trace_address_interactions(
+        mock2,
+        "target",
+        max_depth=2,
+        skip_tx_hashes=skip,
+    )
+    # With all tx_hashes skipped, no tx details should be fetched
+    assert mock2.get_transaction_utxos.call_count == 0, (
+        f"Expected 0 singular tx fetches with skip_tx_hashes, "
+        f"got {mock2.get_transaction_utxos.call_count}"
+    )
+    assert mock2.get_transactions_utxos.call_count == 0, (
+        f"Expected 0 batch tx fetches with skip_tx_hashes, "
+        f"got {mock2.get_transactions_utxos.call_count}"
+    )
+    # Result should be empty (all txs skipped)
+    assert result2.total_transactions == 0
+    assert len(result2.edges) == 0
+    assert len(result2.addresses) == 1  # only target address, no edges
+
+
+@pytest.mark.asyncio
+async def test_skip_tx_hashes_target_only_fallback(temp_cache):
+    """B6: cli.py fallback still works when processed_by_addr is None.
+
+    The or-fallback in cli.py (L1026, L1042) should only apply when
+    processed_by_addr is None. When it's present, use it directly.
+    """
+    cache_mod = temp_cache
+
+    # Trace at depth 1 only (just target address, no counterparties)
+    tx_data: dict[str, list[dict]] = {
+        "target": [
+            {
+                "tx_hash": "tx_target_0",
+                "inputs": {"target": 20.0},
+                "outputs": {"counterparty": 20.0},
+            }
+        ],
+        "counterparty": [],  # no txs (leaf)
+    }
+    mock = _make_mock_provider(tx_data)
+    result1 = await trace_address_interactions(mock, "target", max_depth=1)
+    _save_trace_to_cache(cache_mod, "target", result1, max_depth=1)
+
+    cached_partial = load_address_trace_partial("target", max_depth=1)
+    assert cached_partial is not None
+    skip = cached_partial.processed_by_addr
+    assert skip is not None, "processed_by_addr should exist even for depth-1 traces"
+
+    # The target address should be in skip with its tx hash
+    assert "target" in skip
+    assert "tx_target_0" in skip["target"]
+
+    # Verify skipping works: second trace with skip_tx_hashes
+    mock2 = _make_mock_provider(tx_data)
+    result2 = await trace_address_interactions(
+        mock2, "target", max_depth=1, skip_tx_hashes=skip
+    )
+    assert mock2.get_transaction_utxos.call_count == 0
+    assert result2.total_transactions == 0

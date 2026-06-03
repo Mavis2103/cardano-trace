@@ -1,0 +1,48 @@
+B6: skip_tx_hashes multi-address — EVIDENCE
+=============================================
+
+Date: 2026-06-03
+Status: COMPLETE
+
+Changes Made
+------------
+
+1. cache.py L1089: Removed `if processed_by_addr else None` fallback
+   • Before: processed_by_addr=processed_by_addr if processed_by_addr else None
+   • After:  processed_by_addr=processed_by_addr
+   • Reason: Empty dict {} was being converted to None, losing the distinction
+     between "no data" (None) and "empty dict" ({}). Now always returns dict.
+
+2. cli.py L1026-1044: Removed target-only fallback
+   • Before: cached_partial.processed_by_addr or {address: cached_partial.processed | cached_partial.failed}
+   • After:  cached_partial.processed_by_addr or {}
+   • Reason: The old fallback only covered the target address, meaning
+     counterparty tx hashes at depth > 1 were never skipped even when cached.
+     With B2's processed_by_addr correctly populated for ALL addresses,
+     the fallback is now just {} (empty dict → no skipping).
+
+3. tests/test_address_interactions.py: Added 2 tests
+   • test_skip_tx_hashes_multi_address:
+     - Depth-2 trace saves all data to cache
+     - Verified processed_by_addr has entries for target AND counterparties
+     - Second trace with skip_tx_hashes: 0 tx-detail fetches (all skipped)
+   • test_skip_tx_hashes_target_only_fallback:
+     - Depth-1 trace with skip_tx_hashes: 0 tx-detail fetches
+
+Verified
+--------
+• test_skip_tx_hashes_multi_address → PASS
+• test_skip_tx_hashes_target_only_fallback → PASS
+• Full test suite: 13/13 passed, 0 failures, 0 regressions
+
+Key Understanding
+-----------------
+address_interactions.py L148-149 already correctly handles per-address
+skip_tx_hashes lookups:
+    if skip_tx_hashes and current_addr in skip_tx_hashes:
+        tx_hashes = [h for h in tx_hashes if h not in skip_tx_hashes[current_addr]]
+
+No fix was needed in the BFS loop — it already supports the per-address
+dict format. The only bugs were:
+  1. cache.py returning None instead of empty dict
+  2. cli.py fallback constructing target-only dict

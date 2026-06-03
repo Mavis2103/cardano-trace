@@ -79,6 +79,15 @@ async def trace_forward(
         address = step.utxo.address
         if address in spent_cache:
             spent_refs = spent_cache[address]
+        elif cached_outputs and address in cached_outputs:
+            spent_refs = [
+                OutRef(
+                    tx_hash=node_id.rsplit(":", 1)[0],
+                    output_index=int(node_id.rsplit(":", 1)[1]),
+                )
+                for node_id in cached_outputs[address]
+            ]
+            spent_cache[address] = spent_refs
         else:
             try:
                 spent_refs = await asyncio.wait_for(

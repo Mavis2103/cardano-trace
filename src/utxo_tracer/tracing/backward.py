@@ -68,7 +68,11 @@ async def trace_backward(
 
         # Best-effort input_utxos pre-cache: even when cached_inputs exists,
         # try to fetch TX data to pre-cache nodes missing from cached_nodes.
-        if cached_nodes is not None and cached_inputs and out_ref.node_id() in cached_inputs:
+        if (
+            cached_nodes is not None
+            and cached_inputs
+            and out_ref.node_id() in cached_inputs
+        ):
             try:
                 tx_data = await asyncio.wait_for(
                     provider.get_transaction_utxos(out_ref.tx_hash),
@@ -90,10 +94,13 @@ async def trace_backward(
                 if edge_id not in seen_edges:
                     seen_edges.add(edge_id)
                     parts = src_id.rsplit(":", 1)
-                    queue.append((
-                        OutRef(parts[0], int(parts[1])),
-                        depth + 1, out_ref,
-                    ))
+                    queue.append(
+                        (
+                            OutRef(parts[0], int(parts[1])),
+                            depth + 1,
+                            out_ref,
+                        )
+                    )
         else:
             try:
                 tx_data = await asyncio.wait_for(
@@ -116,14 +123,14 @@ async def trace_backward(
                 save_transaction(out_ref.tx_hash, tx_data)
             except asyncio.TimeoutError:
                 yield TraceStep(
-                    out_ref=OutRef(out_ref.tx_hash, -1),
+                    out_ref=out_ref,
                     direction="backward",
                     depth=depth,
                     error=f"Timeout fetching tx {out_ref.tx_hash}",
                 )
             except Exception as e:
                 yield TraceStep(
-                    out_ref=OutRef(out_ref.tx_hash, -1),
+                    out_ref=out_ref,
                     direction="backward",
                     depth=depth,
                     error=f"{type(e).__name__}: {e}",

@@ -1023,9 +1023,7 @@ def trace_address_cmd(
                 cache_mod.finalize_address_trace(address, max_depth)
                 n_ok = len(cached_partial.processed)
                 n_fail = len(cached_partial.failed)
-                skip_tx_hashes = cached_partial.processed_by_addr or {
-                    address: cached_partial.processed | cached_partial.failed
-                }
+                skip_tx_hashes = cached_partial.processed_by_addr or {}
                 cached_tx_count = n_ok
                 if n_fail:
                     console.print(
@@ -1039,9 +1037,7 @@ def trace_address_cmd(
                 # Partial or needs extension — skip processed txs, query remainder
                 n_ok = len(cached_partial.processed)
                 n_fail = len(cached_partial.failed)
-                skip_tx_hashes = cached_partial.processed_by_addr or {
-                    address: cached_partial.processed | cached_partial.failed
-                }
+                skip_tx_hashes = cached_partial.processed_by_addr or {}
                 cached_tx_count = n_ok
 
                 if needs_extend:
