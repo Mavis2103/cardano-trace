@@ -1109,16 +1109,6 @@ def trace_address_cmd(
                 0  # tracks live tx count (works for both batch + concurrent paths)
             )
 
-            async def _progress_callback(completed: int, total: int) -> None:
-                nonlocal progress_task_id
-                if progress_task_id is not None:
-                    progress.update(
-                        progress_task_id,
-                        advance=0,
-                        description=f"[cyan]address[/cyan] tx=#{completed}/{total}",
-                    )
-                    progress.refresh()
-
             def _step_callback(
                 source_address: str, tx_hash: str, error: Optional[str], depth: int
             ) -> None:
@@ -1144,7 +1134,8 @@ def trace_address_cmd(
                 short = (
                     tx_hash[:10] + "…" + tx_hash[-4:] if len(tx_hash) > 16 else tx_hash
                 )
-                err_mark = " [red]\u2717[/red]" if error else ""
+                err = error.split(":")[0] if error else ""
+                err_mark = f" [red]\u2717 {err}[/red]" if error else ""
                 pname = (
                     getattr(p, "current_provider", "")
                     or getattr(p, "provider_type", "")
@@ -1189,7 +1180,6 @@ def trace_address_cmd(
                     tx_limit=tx_limit,
                     skip_tx_hashes=skip_tx_hashes if skip_tx_hashes else None,
                     step_callback=_step_callback,
-                    progress_callback=_progress_callback,
                 )
 
             # End-of-run cached/live summary (identical to UTXO trace)
