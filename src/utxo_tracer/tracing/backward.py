@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from typing import AsyncGenerator, Optional
 
+from ..cache import save_transaction
 from ..models import OutRef, TraceStep, UTxONode
 from ..providers.base import Provider
 
@@ -77,6 +78,8 @@ async def trace_backward(
                 for src_id in cached_inputs[out_ref.node_id()]:
                     if src_id in input_utxos and src_id not in cached_nodes:
                         cached_nodes[src_id] = input_utxos[src_id]
+                # Cross-cache: save tx data so any trace type can reuse it
+                save_transaction(out_ref.tx_hash, tx_data)
             except Exception:
                 pass  # best-effort — fall through to individual fetches
 
@@ -109,6 +112,8 @@ async def trace_backward(
                     if edge_id not in seen_edges:
                         seen_edges.add(edge_id)
                         queue.append((input_ref, depth + 1, out_ref))
+                # Cross-cache: save tx data so any trace type can reuse it
+                save_transaction(out_ref.tx_hash, tx_data)
             except asyncio.TimeoutError:
                 yield TraceStep(
                     out_ref=OutRef(out_ref.tx_hash, -1),

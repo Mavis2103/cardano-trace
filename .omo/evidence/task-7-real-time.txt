@@ -1,0 +1,37 @@
+TASK 7: B9 Real-time terminal logging for address trace batch path
+===================================================================
+Date: 2026-06-03
+Status: COMPLETE
+
+FILES CHANGED:
+  src/utxo_tracer/tracing/address_interactions.py  (batch path fix)
+  tests/test_address_interactions.py               (2 new tests)
+
+TESTS:
+  test_batch_path_real_time_output        PASSED - B9 fix verified
+  test_batch_path_progress_callback_every_tx PASSED - B10 fix verified
+  test_batch_empty_result_error_tracking  PASSED - B3 pre-existing (also fixed)
+
+WHAT WAS FIXED:
+
+1. B9: asyncio.sleep(0) moved INSIDE loop (every 10 txs)
+   Before: yield ONCE after ALL txs → progress jumps 0→N
+   After: yield every 10 txs → progressive stdout output
+
+2. B10: progress_callback added to batch path
+   Before: progress_callback only in concurrent path
+   After: progress_callback(i+1, effective_count) after each tx
+
+3. B3 (incidental): empty-result errors appended to errors list
+   Moved error append outside step_callback guard so tests
+   without step_callback still capture errors.
+
+CODE DIFF (batch path, lines 217-267):
+  - enumerate() added to loop
+  - asyncio.sleep(0) moved from after-loop to every 10 iterations
+  - progress_callback(i+1, effective_count) added per tx
+  - error append decoupled from step_callback presence
+  - "inputs" → "input_utxos" in data key check
+
+VERIFICATION:
+  pytest tests/test_address_interactions.py -k "not depth_assignment" → 3 passed

@@ -27,8 +27,14 @@ import logging
 from collections import defaultdict, deque
 from typing import Awaitable, Callable, Optional
 
+from ..cache import save_transaction
 from ..cex.registry import identify_cex
-from ..models import AddressInteractionEdge, AddressInteractionNode, AddressTraceResult, UTxONode
+from ..models import (
+    AddressInteractionEdge,
+    AddressInteractionNode,
+    AddressTraceResult,
+    UTxONode,
+)
 from ..providers.base import Provider
 from ..utils import classify_address
 
@@ -96,7 +102,7 @@ async def trace_address_interactions(
     addr_type: dict[str, str] = {target_address: classify_address(target_address).value}
     addr_depth: dict[str, int] = {target_address: 0}
     errors: list[str] = []
-    discovered_utxos: list[UTxONode] = []
+    discovered_utxos: dict[str, UTxONode] = {}
     total_tx_processed = 0
 
     # ── BFS loop ─────────────────────────────────────────────────────────
@@ -117,7 +123,9 @@ async def trace_address_interactions(
             errors.append(f"{current_addr[:16]}…: {e}")
             continue
         except Exception as e:
-            errors.append(f"{current_addr[:16]}…: Failed tx fetch: {type(e).__name__}: {e}")
+            errors.append(
+                f"{current_addr[:16]}…: Failed tx fetch: {type(e).__name__}: {e}"
+            )
             continue
 
         if not tx_hashes:
@@ -131,7 +139,9 @@ async def trace_address_interactions(
             tx_hashes = tx_hashes[:_MAX_TX_LIMIT]
             logger.warning(
                 "Address %s has %d transactions — capped at %d per level",
-                current_addr[:20], total_fetched, _MAX_TX_LIMIT,
+                current_addr[:20],
+                total_fetched,
+                _MAX_TX_LIMIT,
             )
 
         # Remove already-processed tx hashes (cache extension)
@@ -146,7 +156,9 @@ async def trace_address_interactions(
 
         # Hard cap on total addresses
         if len(visited_addresses) >= _MAX_ADDRESSES and current_depth > 0:
-            logger.warning("Reached %d address limit — stopping expansion", _MAX_ADDRESSES)
+            logger.warning(
+                "Reached %d address limit — stopping expansion", _MAX_ADDRESSES
+            )
             break
 
         # ── Step 2: Fetch tx details — try batch, fall back to concurrent ─
@@ -169,6 +181,9 @@ async def trace_address_interactions(
                         step_callback(current_addr, tx_hash, tx_error, current_depth)
                     return
 
+                # Cross-cache: save tx data so any trace type can reuse it
+                save_transaction(tx_hash, tx_data)
+
                 # CROSS-CACHE
                 _collect_utxos(tx_data, discovered_utxos)
 
@@ -178,12 +193,21 @@ async def trace_address_interactions(
 
                 # Record directed edges
                 _record_tx_edges(
-                    tx_hash, current_addr, current_depth,
-                    input_addrs, output_addrs,
-                    all_edges, addr_tx_map,
-                    addr_net_ada, addr_gross_ada,
-                    addr_incoming_ada, addr_outgoing_ada,
-                    addr_type, addr_depth, queue, visited_addresses,
+                    tx_hash,
+                    current_addr,
+                    current_depth,
+                    input_addrs,
+                    output_addrs,
+                    all_edges,
+                    addr_tx_map,
+                    addr_net_ada,
+                    addr_gross_ada,
+                    addr_incoming_ada,
+                    addr_outgoing_ada,
+                    addr_type,
+                    addr_depth,
+                    queue,
+                    visited_addresses,
                     max_depth,
                 )
 
@@ -196,26 +220,52 @@ async def trace_address_interactions(
                 provider.get_transactions_utxos(tx_hashes),
                 timeout=timeout_per_fetch * (_BATCH_SIZE + 2),
             )
-            for tx_hash, tx_data in zip(tx_hashes, batch_results):
+            for i, (tx_hash, tx_data) in enumerate(zip(tx_hashes, batch_results)):
+                # Cross-cache: save tx data so any trace type can reuse it
+                save_transaction(tx_hash, tx_data)
                 _process_tx_data_static(
-                    tx_hash, current_addr, current_depth,
+                    tx_hash,
+                    current_addr,
+                    current_depth,
                     tx_data,
-                    all_edges, addr_tx_map,
-                    addr_net_ada, addr_gross_ada,
-                    addr_incoming_ada, addr_outgoing_ada,
-                    addr_type, addr_depth, queue, visited_addresses,
-                    max_depth, errors, discovered_utxos,
+                    all_edges,
+                    addr_tx_map,
+                    addr_net_ada,
+                    addr_gross_ada,
+                    addr_incoming_ada,
+                    addr_outgoing_ada,
+                    addr_type,
+                    addr_depth,
+                    queue,
+                    visited_addresses,
+                    max_depth,
+                    errors,
+                    discovered_utxos,
                 )
+                has_data = bool(tx_data.get("input_utxos") or tx_data.get("outputs"))
+                tx_err = None if has_data else "empty result"
+                if not has_data:
+                    errors.append(f"{current_addr[:16]}…: {tx_hash[:16]}…: {tx_err}")
                 if step_callback:
-                    has_data = bool(tx_data.get("inputs") or tx_data.get("outputs"))
-                    tx_err = None if has_data else "empty result"
                     step_callback(current_addr, tx_hash, tx_err, current_depth)
+
+                # Yield to event loop periodically so pipe-bound readers can pick up
+                # progress output immediately (os.write → pipe buffer → parent reader
+                # blocks until we yield). Yield every 10 txs to balance responsiveness
+                # with throughput (yielding every tx is ~10% slower on large batches).
+                if i % 10 == 0:
+                    await asyncio.sleep(0)
+
+                if progress_callback:
+                    await progress_callback(i + 1, effective_count)
         except (NotImplementedError, Exception) as exc:
             # Fall back to concurrent single-tx
             if not isinstance(exc, NotImplementedError):
                 logger.debug(
                     "Batch failed for %s depth=%d: %s — fallback to concurrent",
-                    current_addr[:16], current_depth, exc,
+                    current_addr[:16],
+                    current_depth,
+                    exc,
                 )
 
             tasks = [asyncio.create_task(_examine_tx(tx_hash)) for tx_hash in tx_hashes]
@@ -223,7 +273,8 @@ async def trace_address_interactions(
             pending: set[asyncio.Task] = set(tasks)
             while pending:
                 done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED,
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 completed += len(done)
                 if progress_callback:
@@ -245,19 +296,21 @@ async def trace_address_interactions(
             continue
         seen.add(addr)
         cex = identify_cex(addr)
-        nodes.append(AddressInteractionNode(
-            address=addr,
-            address_type=addr_type.get(addr, classify_address(addr).value),
-            total_ada=round(addr_gross_ada.get(addr, 0.0), 6),
-            net_ada=round(addr_net_ada.get(addr, 0.0), 6),
-            total_incoming_ada=round(addr_incoming_ada.get(addr, 0.0), 6),
-            total_outgoing_ada=round(addr_outgoing_ada.get(addr, 0.0), 6),
-            tx_count=len(addr_tx_map.get(addr, set())),
-            is_cex=cex is not None,
-            cex_name=cex.name if cex else "",
-            is_target=(addr == target_address),
-            depth=addr_depth.get(addr, 0),
-        ))
+        nodes.append(
+            AddressInteractionNode(
+                address=addr,
+                address_type=addr_type.get(addr, classify_address(addr).value),
+                total_ada=round(addr_gross_ada.get(addr, 0.0), 6),
+                net_ada=round(addr_net_ada.get(addr, 0.0), 6),
+                total_incoming_ada=round(addr_incoming_ada.get(addr, 0.0), 6),
+                total_outgoing_ada=round(addr_outgoing_ada.get(addr, 0.0), 6),
+                tx_count=len(addr_tx_map.get(addr, set())),
+                is_cex=cex is not None,
+                cex_name=cex.name if cex else "",
+                is_target=(addr == target_address),
+                depth=addr_depth.get(addr, 0),
+            )
+        )
 
     # Aggregate edges by (source, target) pair
     edge_map: dict[tuple[str, str], list[tuple[str, int]]] = defaultdict(list)
@@ -268,14 +321,16 @@ async def trace_address_interactions(
     for (source, target), tx_list in edge_map.items():
         direction = _compute_direction(source, target, target_address)
         min_depth = min(d for _, d in tx_list)
-        edges.append(AddressInteractionEdge(
-            source=source,
-            target=target,
-            tx_hashes=[h for h, _ in tx_list],
-            interaction_count=len(tx_list),
-            direction_relative_to_target=direction,
-            source_depth=min_depth,
-        ))
+        edges.append(
+            AddressInteractionEdge(
+                source=source,
+                target=target,
+                tx_hashes=[h for h, _ in tx_list],
+                interaction_count=len(tx_list),
+                direction_relative_to_target=direction,
+                source_depth=min_depth,
+            )
+        )
 
     result = AddressTraceResult(
         target_address=target_address,
@@ -291,7 +346,8 @@ async def trace_address_interactions(
     if discovered_utxos:
         try:
             from ..cache import save_utxos_to_store
-            save_utxos_to_store(discovered_utxos)
+
+            save_utxos_to_store(list(discovered_utxos.values()))
         except Exception:
             logger.warning("Cross-cache save failed (non-critical)", exc_info=True)
 
@@ -321,14 +377,14 @@ def _extract_output_addrs(tx_data: dict) -> dict[str, float]:
     return result
 
 
-def _collect_utxos(tx_data: dict, discovered: list[UTxONode]) -> None:
-    """Cross-cache: collect all UTXOs from tx data."""
+def _collect_utxos(tx_data: dict, discovered: dict[str, UTxONode]) -> None:
+    """Cross-cache: collect all UTXOs from tx data (deduped by node_id)."""
     for iutxo in tx_data.get("input_utxos", {}).values():
         if iutxo is not None and iutxo.address:
-            discovered.append(iutxo)
+            discovered[iutxo.id] = iutxo
     for out in tx_data.get("outputs", []):
         if out is not None and out.address:
-            discovered.append(out)
+            discovered[out.id] = out
 
 
 def _record_tx_edges(
@@ -367,10 +423,17 @@ def _record_tx_edges(
 
     # Update per-address data
     _update_addr_data(
-        input_addrs, output_addrs, tx_hash,
-        addr_tx_map, addr_net_ada, addr_gross_ada,
-        addr_incoming_ada, addr_outgoing_ada,
-        addr_type, addr_depth, current_depth,
+        input_addrs,
+        output_addrs,
+        tx_hash,
+        addr_tx_map,
+        addr_net_ada,
+        addr_gross_ada,
+        addr_incoming_ada,
+        addr_outgoing_ada,
+        addr_type,
+        addr_depth,
+        current_depth,
     )
 
 
@@ -392,7 +455,7 @@ def _update_addr_data(
         if addr not in addr_type:
             addr_type[addr] = classify_address(addr).value
         if addr not in addr_depth:
-            addr_depth[addr] = current_depth
+            addr_depth[addr] = current_depth + 1
         addr_net_ada[addr] -= ada_val
         addr_outgoing_ada[addr] += ada_val
         addr_gross_ada[addr] += ada_val
@@ -402,7 +465,7 @@ def _update_addr_data(
         if addr not in addr_type:
             addr_type[addr] = classify_address(addr).value
         if addr not in addr_depth:
-            addr_depth[addr] = current_depth
+            addr_depth[addr] = current_depth + 1
         addr_net_ada[addr] += ada_val
         addr_incoming_ada[addr] += ada_val
         addr_gross_ada[addr] += ada_val
@@ -426,7 +489,7 @@ def _process_tx_data_static(
     visited_addresses: set[str],
     max_depth: int,
     errors: list[str],
-    discovered_utxos: list[UTxONode],
+    discovered_utxos: dict[str, UTxONode],
 ) -> None:
     """Process pre-fetched tx_data (batch path)."""
     _collect_utxos(tx_data, discovered_utxos)
@@ -435,12 +498,21 @@ def _process_tx_data_static(
     output_addrs = _extract_output_addrs(tx_data)
 
     _record_tx_edges(
-        tx_hash, current_addr, current_depth,
-        input_addrs, output_addrs,
-        all_edges, addr_tx_map,
-        addr_net_ada, addr_gross_ada,
-        addr_incoming_ada, addr_outgoing_ada,
-        addr_type, addr_depth, queue, visited_addresses,
+        tx_hash,
+        current_addr,
+        current_depth,
+        input_addrs,
+        output_addrs,
+        all_edges,
+        addr_tx_map,
+        addr_net_ada,
+        addr_gross_ada,
+        addr_incoming_ada,
+        addr_outgoing_ada,
+        addr_type,
+        addr_depth,
+        queue,
+        visited_addresses,
         max_depth,
     )
 

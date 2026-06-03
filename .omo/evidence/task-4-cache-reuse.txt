@@ -1,0 +1,14 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /home/mavis/Documents/trace-utxo/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/mavis/Documents/trace-utxo
+configfile: pytest.ini
+plugins: asyncio-1.4.0, dash-4.2.0, anyio-4.13.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 9 items / 6 deselected / 3 selected
+
+tests/test_address_interactions.py::TestMultiHopCacheReuse::test_cache_bypass_bug_fixed PASSED [ 33%]
+tests/test_address_interactions.py::TestMultiHopCacheReuse::test_full_cache_hit_no_provider_calls PASSED [ 66%]
+tests/test_address_interactions.py::TestMultiHopCacheReuse::test_partial_extend_only_new_depth_queried PASSED [100%]
+
+======================= 3 passed, 6 deselected in 0.37s ========================

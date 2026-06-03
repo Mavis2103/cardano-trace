@@ -9,6 +9,7 @@ import asyncio
 from collections import deque
 from typing import AsyncGenerator, Optional
 
+from ..cache import save_transaction
 from ..models import OutRef, TraceStep, UTxONode
 from ..providers.base import Provider
 
@@ -132,6 +133,9 @@ async def trace_forward(
                     error=f"{type(e).__name__}: {e}",
                 )
                 continue
+
+            # Cross-cache: save tx data so any trace type can reuse it
+            save_transaction(spending_tx_hash, tx_data)
 
             for out_node in tx_data.get("outputs") or []:
                 next_ref = out_node.out_ref
