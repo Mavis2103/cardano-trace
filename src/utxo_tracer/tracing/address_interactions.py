@@ -339,6 +339,14 @@ async def trace_address_interactions(
             )
         )
 
+    if not edges and total_tx_processed > 0 and errors:
+        logger.warning(
+            "Provider returned empty data for ALL %d transactions of %s — "
+            "check API key permissions (need /txs/{hash}/utxos access)",
+            total_tx_processed,
+            target_address[:20],
+        )
+
     result = AddressTraceResult(
         target_address=target_address,
         addresses=nodes,
