@@ -29,3 +29,6 @@ packages = ["src/utxo_tracer"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
