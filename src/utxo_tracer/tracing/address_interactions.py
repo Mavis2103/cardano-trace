@@ -104,6 +104,7 @@ async def trace_address_interactions(
     errors: list[str] = []
     discovered_utxos: dict[str, UTxONode] = {}
     total_tx_processed = 0
+    per_addr_tx_count: dict[str, int] = defaultdict(int)
 
     # ── BFS loop ─────────────────────────────────────────────────────────
     while queue:
@@ -153,6 +154,7 @@ async def trace_address_interactions(
             continue
 
         total_tx_processed += effective_count
+        per_addr_tx_count[current_addr] = effective_count
 
         # Hard cap on total addresses
         if len(visited_addresses) >= _MAX_ADDRESSES and current_depth > 0:
@@ -277,6 +279,9 @@ async def trace_address_interactions(
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 completed += len(done)
+                await asyncio.sleep(
+                    0
+                )  # yield to event loop so Rich progress can render
                 if progress_callback:
                     await progress_callback(completed, effective_count)
 
@@ -296,6 +301,8 @@ async def trace_address_interactions(
             continue
         seen.add(addr)
         cex = identify_cex(addr)
+        detail_tx_count = len(addr_tx_map.get(addr, set()))
+        addr_level_count = per_addr_tx_count.get(addr, 0)
         nodes.append(
             AddressInteractionNode(
                 address=addr,
@@ -304,7 +311,7 @@ async def trace_address_interactions(
                 net_ada=round(addr_net_ada.get(addr, 0.0), 6),
                 total_incoming_ada=round(addr_incoming_ada.get(addr, 0.0), 6),
                 total_outgoing_ada=round(addr_outgoing_ada.get(addr, 0.0), 6),
-                tx_count=len(addr_tx_map.get(addr, set())),
+                tx_count=detail_tx_count or addr_level_count,
                 is_cex=cex is not None,
                 cex_name=cex.name if cex else "",
                 is_target=(addr == target_address),
