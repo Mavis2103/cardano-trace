@@ -18,20 +18,19 @@ def _make_async_provider():
 
 def _patch_all(save_funcs):
     """Start patchers for given list of cache save function paths.
-    Returns (started_patchers, mock_objects_by_name).
+    Returns (patcher_objects, mock_objects_by_name).
     """
     patchers = [patch(p) for p in save_funcs]
     patchers.append(patch("utxo_tracer.cli.load_config", return_value={}))
     patchers.append(
         patch("utxo_tracer.cache._store_to_models", return_value=({}, {}, {}))
     )
-    started = [p.start() for p in patchers]
-    # Return only the mock for the save function patches (exclude config & store)
-    return started, started[:-2]
+    mocks = [p.start() for p in patchers]
+    return patchers, mocks[:-2]
 
 
-def _stop_all(patchers):
-    for p in patchers:
+def _stop_all(patcher_objects):
+    for p in patcher_objects:
         p.stop()
 
 
