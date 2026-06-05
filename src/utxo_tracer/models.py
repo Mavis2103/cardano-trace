@@ -111,6 +111,9 @@ class AddressInteractionNode:
     cex_name: str = ""
     is_target: bool = False
     depth: int = 0  # hop distance from target address
+    # Non-CEX wallet that directly sent to / received from a registered CEX
+    # address. Holds the CEX label, e.g. "Binance User". Empty otherwise.
+    cex_user: str = ""
 
 
 @dataclass
@@ -141,6 +144,7 @@ class AddressTraceResult:
     error: Optional[str] = None
     provider_name: str = ""
     max_depth: int = 1
+    direction: str = "both"  # backward | forward | both (flow relative to target)
 
 
 @dataclass

@@ -214,9 +214,14 @@ def _cache_key(start_out_ref: OutRef, direction: str, max_depth: int = 0) -> str
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
-def _addr_cache_key(address: str, max_depth: int = 1) -> str:
-    """Depth-INDEPENDENT address-trace key (see ``_cache_key``)."""
-    key_str = f"addr:{address}"
+def _addr_cache_key(address: str, max_depth: int = 1, direction: str = "both") -> str:
+    """Depth-INDEPENDENT address-trace key (see ``_cache_key``).
+
+    ``direction`` (both/backward/forward) IS part of the key so a forward-only
+    trace does not serve a backward request and vice-versa. ``both`` keeps the
+    legacy key string for backward compatibility with existing caches.
+    """
+    key_str = f"addr:{address}" if direction == "both" else f"addr:{address}/{direction}"
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
@@ -999,12 +1004,14 @@ def find_node_in_cache(
 # ===================================================================
 
 
-def _find_best_addr_cache(address: str, max_depth: int) -> tuple[Optional[str], int]:
+def _find_best_addr_cache(
+    address: str, max_depth: int, direction: str = "both"
+) -> tuple[Optional[str], int]:
     """Find best cached address trace manifest — depth-adaptive lookup via SQLite.
 
-    Priority: exact key → any manifest with same address.
+    Priority: exact key → any manifest with same address+direction.
     """
-    exact_key = get_address_trace_manifest_key(address, max_depth)
+    exact_key = get_address_trace_manifest_key(address, max_depth, direction)
     conn = _get_db()
 
     row = conn.execute(
@@ -1016,8 +1023,9 @@ def _find_best_addr_cache(address: str, max_depth: int) -> tuple[Optional[str], 
 
     rows = conn.execute(
         "SELECT trace_key, max_depth FROM trace_manifests "
-        "WHERE trace_type = 'address' AND start_ref = ?",
-        (address,),
+        "WHERE trace_type = 'address' AND start_ref = ? "
+        "AND (direction = ? OR direction = '')",
+        (address, direction),
     ).fetchall()
 
     best_key: Optional[str] = None
@@ -1043,9 +1051,10 @@ def save_address_trace_step(
     max_depth: int = 1,
     source_address: str = "",
     depth: int = 0,
+    direction: str = "both",
 ) -> None:
     conn = _get_db()
-    trace_key = get_address_trace_manifest_key(address, max_depth)
+    trace_key = get_address_trace_manifest_key(address, max_depth, direction)
 
     existing = conn.execute(
         "SELECT * FROM trace_manifests WHERE trace_key = ?", (trace_key,)
@@ -1054,8 +1063,8 @@ def save_address_trace_step(
         conn.execute(
             """INSERT INTO trace_manifests
                (trace_key, trace_type, start_ref, direction, max_depth, tx_limit)
-               VALUES (?, 'address', ?, '', ?, ?)""",
-            (trace_key, address, max_depth, tx_limit),
+               VALUES (?, 'address', ?, ?, ?, ?)""",
+            (trace_key, address, direction, max_depth, tx_limit),
         )
     else:
         if not error:
@@ -1090,20 +1099,22 @@ def save_address_trace_step(
         save_utxos(discovered_utxos)
 
 
-def get_address_trace_manifest_key(address: str, max_depth: int = 1) -> str:
+def get_address_trace_manifest_key(
+    address: str, max_depth: int = 1, direction: str = "both"
+) -> str:
     """Get the manifest trace key for an address trace."""
-    return f"addr_{_addr_cache_key(address, max_depth)}"
+    return f"addr_{_addr_cache_key(address, max_depth, direction)}"
 
 
 def load_address_trace_partial(
-    address: str, max_depth: int = 1
+    address: str, max_depth: int = 1, direction: str = "both"
 ) -> Optional[CachedAddrTrace]:
     """Load partial address trace progress from SQLite — depth-adaptive.
 
     Finds the best cached manifest for *address* across any max_depth,
     then loads per-step data including per-address processed tx hashes.
     """
-    trace_key, cached_max_depth = _find_best_addr_cache(address, max_depth)
+    trace_key, cached_max_depth = _find_best_addr_cache(address, max_depth, direction)
     if not trace_key:
         return None
 
@@ -1158,9 +1169,11 @@ def load_address_trace_partial(
     )
 
 
-def finalize_address_trace(address: str, max_depth: int = 1) -> None:
+def finalize_address_trace(
+    address: str, max_depth: int = 1, direction: str = "both"
+) -> None:
     """Mark an address trace manifest as completed."""
-    trace_key = get_address_trace_manifest_key(address, max_depth)
+    trace_key = get_address_trace_manifest_key(address, max_depth, direction)
     conn = _get_db()
     conn.execute(
         "UPDATE trace_manifests SET completed = 1, updated_at = ? WHERE trace_key = ?",
@@ -1170,10 +1183,13 @@ def finalize_address_trace(address: str, max_depth: int = 1) -> None:
 
 
 def save_address_trace(
-    result: AddressTraceResult, tx_limit: int = 0, max_depth: int = 1
+    result: AddressTraceResult,
+    tx_limit: int = 0,
+    max_depth: int = 1,
+    direction: str = "both",
 ) -> str:
     """Save v2 address trace snapshot to SQLite."""
-    key = _addr_cache_key(result.target_address, max_depth)
+    key = _addr_cache_key(result.target_address, max_depth, direction)
     suffix = f"_{tx_limit}" if tx_limit else ""
     file_key = f"{key}{suffix}"
 
@@ -1183,11 +1199,13 @@ def save_address_trace(
         "edges": len(result.edges),
         "tx_limit": tx_limit,
         "max_depth": max_depth,
+        "direction": direction,
     }
 
     data = _addr_result_to_dict(result, key)
     data["tx_limit"] = tx_limit
     data["max_depth"] = max_depth
+    data["direction"] = direction
 
     conn = _get_db()
     conn.execute(
@@ -1201,14 +1219,14 @@ def save_address_trace(
 
 
 def load_address_trace(
-    address: str, tx_limit: int = 0, max_depth: int = 1
+    address: str, tx_limit: int = 0, max_depth: int = 1, direction: str = "both"
 ) -> Optional[AddressTraceResult]:
     """Load a v2 address trace snapshot from SQLite — depth-adaptive.
 
     Searches for any snapshot matching *address* with stored max_depth >= *max_depth*
     and sufficient tx_limit.  Falls back to exact-key lookup for backward compat.
     """
-    key = _addr_cache_key(address, max_depth)
+    key = _addr_cache_key(address, max_depth, direction)
     candidates = [f"{key}_{tx_limit}"] if tx_limit else []
     candidates.append(key)
 
@@ -1237,6 +1255,11 @@ def load_address_trace(
     for row in rows:
         data = json.loads(row["data"])
         if data.get("target_address", "") != address:
+            continue
+        # A "both" snapshot is a superset and can serve any direction; a
+        # directional snapshot only serves its own direction.
+        stored_dir = data.get("direction", "both")
+        if stored_dir != "both" and stored_dir != direction:
             continue
         stored_limit = data.get("tx_limit", 0)
         if tx_limit and stored_limit and stored_limit < tx_limit:
@@ -1286,6 +1309,7 @@ def _addr_result_to_dict(result: AddressTraceResult, cache_key: str) -> dict:
                 "cex_name": n.cex_name,
                 "is_target": n.is_target,
                 "depth": n.depth,
+                "cex_user": n.cex_user,
             }
             for n in result.addresses
         ],
@@ -1320,6 +1344,7 @@ def _addr_result_from_dict(
                 cex_name=n.get("cex_name", ""),
                 is_target=n.get("is_target", False),
                 depth=n.get("depth", 0),
+                cex_user=n.get("cex_user", ""),
             )
             for n in data.get("addresses", [])
         ]
@@ -1348,6 +1373,7 @@ def _addr_result_from_dict(
             error=data.get("error"),
             provider_name=data.get("provider_name", ""),
             max_depth=data.get("max_depth", 1),
+            direction=data.get("direction", "both"),
         )
     except Exception as e:
         logger.warning("Failed to parse cached address trace: %s", e)

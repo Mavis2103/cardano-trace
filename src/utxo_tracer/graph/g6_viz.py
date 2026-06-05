@@ -272,6 +272,7 @@ def build_address_payload(
         if not cex:
             c = identify_cex(a)
             cex = c.name if c else ""
+        cex_user = "" if cex else getattr(n, "cex_user", "")
         is_target = n.is_target or a == target
         size = max(35, min(90, 40 + int(8 * (n.tx_count**0.35))))
         if is_target:
@@ -279,12 +280,15 @@ def build_address_payload(
             stroke, sw = "#ffd700", 5
         elif cex:
             stroke, sw = "#f85149", 4
+        elif cex_user:
+            # CEX user (directly transacts with an exchange) — orange ring
+            stroke, sw = "#f0883e", 3
         else:
             stroke, sw = "rgba(255,255,255,.35)", 2
         nodes.append(
             {
                 "id": a,
-                "label": _short_addr(a),
+                "label": (f"{cex_user} User" if cex_user else _short_addr(a)),
                 "address": a,
                 "address_type": atype.value,
                 "total_ada": round(n.total_ada, 6),
@@ -295,9 +299,10 @@ def build_address_payload(
                 "depth": n.depth,
                 "is_target": is_target,
                 "is_start": is_target,
-                # always-on label for root + CEX (key landmarks)
-                "always_label": bool(is_target or cex),
+                # always-on label for root + CEX + CEX-users (key landmarks)
+                "always_label": bool(is_target or cex or cex_user),
                 "cex": cex,
+                "cex_user": cex_user,
                 "color": addr_colour[a],
                 "size": size,
                 "shape": _SHAPE.get(atype, "ellipse"),
@@ -328,6 +333,7 @@ def build_address_payload(
             "tx_count": n.tx_count,
             "is_target": n.is_target or n.address == target,
             "cex": n.cex_name if n.is_cex else "",
+            "cex_user": "" if n.is_cex else getattr(n, "cex_user", ""),
         }
         for n in sorted(result.addresses, key=lambda n: n.tx_count, reverse=True)[:20]
     ]
@@ -335,6 +341,7 @@ def build_address_payload(
     return {
         "kind": "address",
         "title": "Address Interaction Graph",
+        "direction": getattr(result, "direction", "both"),
         "start_id": target,
         "target": target,
         "nodes": nodes,
@@ -438,9 +445,12 @@ _JS = r"""
   const BIG = N > 120;
   // labels shown only when sparse, or on hover/zoom-in (see LOD below)
   let SHOW_LABELS = !BIG;
-  // force strengths grow with N so dense graphs don't collapse into a blob
-  const REPULSE = -(140 + 22 * Math.sqrt(N));
-  const LINKLEN = Math.min(360, 120 + 4 * Math.sqrt(N));
+  // force strengths grow with N so dense graphs don't collapse into a blob.
+  // Stronger repulsion + longer links + bigger collision padding keep large
+  // graphs from overlapping into an unreadable hairball.
+  const REPULSE = -(220 + 40 * Math.sqrt(N));
+  const LINKLEN = Math.min(560, 150 + 8 * Math.sqrt(N));
+  const COLLIDE_PAD = BIG ? 30 : 16;
 
   // collision radius per node so preventOverlap respects actual node size
   const sizeById = {};
@@ -480,6 +490,12 @@ _JS = r"""
       shadowColor: '#f85149', shadowBlur: 20,
       badge: true, badges: [{text:'CEX', placement:'top-right',
         backgroundFill:'#f85149', fill:'#fff', fontSize:8}],
+    };
+    if(n.cex_user) return {
+      halo: true, haloStroke: '#f0883e', haloStrokeWidth: 6, haloOpacity: 0.34,
+      shadowColor: '#f0883e', shadowBlur: 12,
+      badge: true, badges: [{text:'USER', placement:'top-right',
+        backgroundFill:'#f0883e', fill:'#0d1117', fontSize:7}],
     };
     return {};
   }
@@ -523,7 +539,7 @@ _JS = r"""
     switch(t){
       case 'd3-force': return {type:'d3-force', preventOverlap:true,
         nodeSize:(d)=> (sizeById[d.id]||30),
-        collide:{strength:1, radius:(d)=> (sizeById[d.id]||30)/2 + 12},
+        collide:{strength:1, radius:(d)=> (sizeById[d.id]||30)/2 + COLLIDE_PAD},
         link:{distance:LINKLEN}, manyBody:{strength:REPULSE},
         center:{},
         // Live tick animation gives a smooth settle on SMALL graphs. On big
@@ -605,6 +621,7 @@ _JS = r"""
     let title = KIND==='utxo' ? (d.is_start?'START UTXO':'UTXO')
                               : (d.is_target?'TARGET ADDRESS':'ADDRESS');
     if(d.cex) title += ' ['+d.cex+']';
+    else if(d.cex_user) title += ' ['+d.cex_user+' User]';
     t.textContent = title;
     const tc = TYPE_COLOR[d.address_type]||'#8b949e';
     let h = "<div class='kv'>"+d.address+"</div>";
@@ -628,6 +645,7 @@ _JS = r"""
         " / gross "+fmt(d.total_ada)+"</span></div>";
       h += "<div class='kv'>"+fmt(d.tx_count)+" tx · depth "+d.depth+"</div>";
       if(d.cex) h += "<div class='kv' style='border-left:3px solid #f85149'>CEX: "+d.cex+"</div>";
+      else if(d.cex_user) h += "<div class='kv' style='border-left:3px solid #f0883e'>"+d.cex_user+" User <span class='muted'>(direct CEX counterparty)</span></div>";
     }
     b.innerHTML = h;
     detail.style.display = 'block';
@@ -684,13 +702,16 @@ _JS = r"""
   const TYPES = ['wallet','script','byron','stake','unknown'];
   let html = "<div class='sec' style='color:#58a6ff'>"+P.title+"</div>";
   html += "<div class='muted'>"+P.stats.nodes+" nodes · "+P.stats.edges+" edges"+
-    (P.stats.transactions!=null?(" · "+P.stats.transactions+" tx"):"")+"</div>";
+    (P.stats.transactions!=null?(" · "+P.stats.transactions+" tx"):"")+
+    (P.direction&&P.direction!=='both'?(" · "+P.direction):"")+"</div>";
   if(P.error) html += "<div class='kv' style='border-left:3px solid #d29922;color:#d29922'>"+P.error+"</div>";
   html += "<div class='sec'>Landmarks</div>";
   html += "<div class='row'><span class='dot' style='background:#ffd700;box-shadow:0 0 6px #ffd700'></span>"+
     "<span>★ "+(KIND==='utxo'?'start UTXO':'root wallet')+"</span></div>";
   html += "<div class='row'><span class='dot' style='background:#f85149;box-shadow:0 0 6px #f85149'></span>"+
     "<span>CEX address</span></div>";
+  if(KIND!=='utxo') html += "<div class='row'><span class='dot' style='background:#f0883e;box-shadow:0 0 5px #f0883e'></span>"+
+    "<span>CEX user (direct counterparty)</span></div>";
   html += "<div class='row'><span class='muted'>solid = outflow · dashed = inflow</span></div>";
   html += "<div class='sec'>Type filter</div><div id='types'>";
   TYPES.forEach(t=>{ html += "<label class='f'><input type='checkbox' checked value='"+t+
@@ -700,9 +721,10 @@ _JS = r"""
   html += "<div class='sec'>Addresses</div>";
   (P.legend_addrs||[]).forEach(a=>{
     const star = a.is_target?' ★':''; const cx = a.cex?(' ['+a.cex+']'):'';
+    const cu = (!a.cex && a.cex_user)?(' ['+a.cex_user+' User]'):'';
     html += "<div class='row'><span class='dot' style='background:"+a.color+"'></span>"+
       "<code>"+a.short+"</code><span class='muted'>"+
-      (a.tx_count!=null?(a.tx_count+'tx'):'')+star+cx+"</span></div>";
+      (a.tx_count!=null?(a.tx_count+'tx'):'')+star+cx+cu+"</span></div>";
   });
   if(P.assets && P.assets.length){
     html += "<div class='sec'>Assets</div>";
@@ -719,9 +741,18 @@ _JS = r"""
   function applyFilter(){
     const active = new Set(
       [...document.querySelectorAll('#types input:checked')].map(i=>i.value));
+    // hidden node set drives BOTH node + edge visibility — an edge whose
+    // source or target is filtered out must hide too, otherwise dangling
+    // arrows point at nothing.
+    const hidden = new Set();
     P.nodes.forEach(n=>{
-      const vis = active.has(n.address_type) ? 'visible' : 'hidden';
-      try{ graph.setElementVisibility(n.id, vis); }catch(err){}
+      const show = active.has(n.address_type);
+      if(!show) hidden.add(n.id);
+      try{ graph.setElementVisibility(n.id, show ? 'visible' : 'hidden'); }catch(err){}
+    });
+    P.edges.forEach((e, i)=>{
+      const vis = (hidden.has(e.source) || hidden.has(e.target)) ? 'hidden' : 'visible';
+      try{ graph.setElementVisibility('e'+i, vis); }catch(err){}
     });
     // re-run the current layout so the remaining visible nodes recompact
     // instead of leaving holes where filtered nodes used to sit

@@ -923,6 +923,14 @@ def trace_cmd(
     help="How many hops to trace (default: 1 = direct interactions only). "
     "Depth 2 traces interactors of interactors, etc.",
 )
+@click.option(
+    "--direction",
+    type=click.Choice(["backward", "forward", "both"]),
+    default="both",
+    help="Flow direction relative to the target: 'backward' = addresses that "
+    "SENT funds to it (upstream), 'forward' = addresses that RECEIVED from it "
+    "(downstream), 'both' = all (default).",
+)
 @click.option("--output", type=click.Choice(["table", "json", "csv"]), default="table")
 @click.option("--export-json", type=click.Path(dir_okay=False), default=None)
 @click.option("--export-csv", type=click.Path(), default=None)
@@ -956,6 +964,7 @@ def trace_address_cmd(
     ogmios_url,
     tx_limit,
     max_depth,
+    direction,
     output,
     export_json,
     export_csv,
@@ -990,7 +999,9 @@ def trace_address_cmd(
 
     if not no_cache:
         # 1. Try manifest for partial progress
-        cached_partial = cache_mod.load_address_trace_partial(address, max_depth)
+        cached_partial = cache_mod.load_address_trace_partial(
+            address, max_depth, direction
+        )
         if cached_partial is not None:
             cached_tx_limit = cached_partial.tx_limit
             needs_extend = (
@@ -1004,7 +1015,10 @@ def trace_address_cmd(
             if cached_partial.completed and not needs_extend:
                 # Full hit — load final v2 snapshot
                 cached = cache_mod.load_address_trace(
-                    address, tx_limit=effective_tx_limit, max_depth=max_depth
+                    address,
+                    tx_limit=effective_tx_limit,
+                    max_depth=max_depth,
+                    direction=direction,
                 )
                 if cached is not None:
                     console.print("[green]Loaded from local cache[/green]")
@@ -1021,7 +1035,7 @@ def trace_address_cmd(
                         start_address_server(
                             result,
                             target_address=address,
-                            cache_key=cache_mod._addr_cache_key(address),
+                            cache_key=cache_mod._addr_cache_key(address, direction=direction),
                         )
                     else:
                         _print_address_summary(result)
@@ -1032,7 +1046,7 @@ def trace_address_cmd(
                 # every already-fetched tx from the global store for free, so
                 # the rebuilt result is complete (no provider re-query of the
                 # cached txs).
-                cache_mod.finalize_address_trace(address, max_depth)
+                cache_mod.finalize_address_trace(address, max_depth, direction)
                 n_ok = len(cached_partial.processed)
                 n_fail = len(cached_partial.failed)
                 if n_fail:
@@ -1082,7 +1096,7 @@ def trace_address_cmd(
                     start_address_server(
                         result,
                         target_address=address,
-                        cache_key=cache_mod._addr_cache_key(address),
+                        cache_key=cache_mod._addr_cache_key(address, direction=direction),
                     )
                 else:
                     _print_address_summary(result)
@@ -1146,6 +1160,7 @@ def trace_address_cmd(
                             max_depth=max_depth,
                             source_address=source_address,
                             depth=depth,
+                            direction=direction,
                         )
                     except Exception:
                         pass
@@ -1194,6 +1209,19 @@ def trace_address_cmd(
                     progress.update(progress_task_id, description=desc)
                 progress.refresh()
 
+            async def _progress_callback(completed: int, total: int) -> None:
+                """Make the bar DETERMINATE per address level so it visibly fills
+                as each tx lands (UTXO-trace parity), instead of an endless
+                spinner that looks like it does nothing then dumps logs."""
+                nonlocal progress_task_id
+                if progress_task_id is None:
+                    progress_task_id = progress.add_task(
+                        "[cyan]address[/cyan]", total=total
+                    )
+                else:
+                    progress.update(progress_task_id, total=total)
+                progress.refresh()
+
             progress = LiveProgress(
                 SpinnerColumn(),
                 TextColumn("{task.description}"),
@@ -1215,9 +1243,17 @@ def trace_address_cmd(
                     address,
                     max_depth=max_depth,
                     tx_limit=tx_limit,
+                    direction=direction,
+                    progress_callback=_progress_callback,
                     step_callback=_step_callback,
                     status_callback=_status_callback,
                     tx_cache_get=(None if no_cache else cache_mod.get_transaction),
+                    addr_txs_cache_get=(
+                        None if no_cache else cache_mod.get_address_txns
+                    ),
+                    addr_txs_cache_save=(
+                        None if no_cache else cache_mod.save_address_txns
+                    ),
                 )
 
             # End-of-run summary. _processed_count counts every tx handled
@@ -1259,9 +1295,12 @@ def trace_address_cmd(
         # so a rate-limited extension doesn't clobber a good cache.
         if result.addresses and not result.error:
             cache_mod.save_address_trace(
-                result, tx_limit=effective_tx_limit, max_depth=max_depth
+                result,
+                tx_limit=effective_tx_limit,
+                max_depth=max_depth,
+                direction=direction,
             )
-            cache_mod.finalize_address_trace(address, max_depth)
+            cache_mod.finalize_address_trace(address, max_depth, direction)
         else:
             logger.info(
                 "Skipping v2 snapshot save (no edges) — keeping prior snapshot"
@@ -1290,7 +1329,7 @@ def trace_address_cmd(
         start_address_server(
             result,
             target_address=address,
-            cache_key=cache_mod._addr_cache_key(address),
+            cache_key=cache_mod._addr_cache_key(address, direction=direction),
         )
     else:
         console.print("[green]Trace complete — use --dash to view graph[/green]")
@@ -1303,6 +1342,7 @@ def _print_address_summary(result: AddressTraceResult) -> None:
     from .models import AddressTraceResult
 
     n_cex = sum(1 for n in result.addresses if n.is_cex)
+    n_cex_users = sum(1 for n in result.addresses if n.cex_user)
     net_flow = sum(n.net_ada for n in result.addresses)
     n_incoming = sum(
         1 for e in result.edges if e.direction_relative_to_target == "incoming"
@@ -1310,15 +1350,22 @@ def _print_address_summary(result: AddressTraceResult) -> None:
     n_outgoing = sum(
         1 for e in result.edges if e.direction_relative_to_target == "outgoing"
     )
+    cex_user_line = (
+        [f"[bold]CEX users (Binance User …):[/bold] {n_cex_users}"]
+        if n_cex_users
+        else []
+    )
     panel = Panel.fit(
         "\n".join(
             [
                 f"[bold]Target:[/bold] {shorten(result.target_address, 14, 8)}",
+                f"[bold]Direction:[/bold] {getattr(result, 'direction', '') or 'both'}",
                 f"[bold]Transactions examined:[/bold] {result.total_transactions}",
                 f"[bold]Connected addresses:[/bold] {len(result.addresses)}",
                 f"[bold]Interactions (edges):[/bold] {len(result.edges)} "
                 f"([green]→{n_outgoing}[/green] [red]←{n_incoming}[/red] [dim]{len(result.edges) - n_incoming - n_outgoing} other[/dim])",
                 f"[bold]CEX hits:[/bold] {n_cex}",
+                *cex_user_line,
                 f"[bold]Provider:[/bold] {result.provider_name or 'fallback'}",
                 f"[bold]Net ADA flow:[/bold] {net_flow:+,.6f}",
             ]
@@ -1394,6 +1441,9 @@ def _print_address_nodes_table(result: AddressTraceResult) -> None:
         elif n.is_cex:
             row_style = "bold red"
             target_mark = " "
+        elif n.cex_user:
+            row_style = "bold dark_orange"
+            target_mark = " "
         elif abs(n.net_ada) >= 100:
             row_style = "yellow"
             target_mark = " "
@@ -1401,7 +1451,12 @@ def _print_address_nodes_table(result: AddressTraceResult) -> None:
             row_style = ""
             target_mark = " "
         type_display = _TYPE_LABEL.get(n.address_type, "[dim]?[/dim]")
-        cex_label = n.cex_name if n.is_cex else ""
+        if n.is_cex:
+            cex_label = n.cex_name
+        elif n.cex_user:
+            cex_label = f"{n.cex_user} User"
+        else:
+            cex_label = ""
         net_label = (
             f"[green]+{n.net_ada:,.0f}[/green]"
             if n.net_ada > 0
@@ -1499,6 +1554,7 @@ def _export_address_json(result: AddressTraceResult, path: str) -> None:
                 "tx_count": n.tx_count,
                 "is_cex": n.is_cex,
                 "cex_name": n.cex_name,
+                "cex_user": n.cex_user,
                 "is_target": n.is_target,
             }
             for n in result.addresses
@@ -1515,6 +1571,7 @@ def _export_address_json(result: AddressTraceResult, path: str) -> None:
         ],
         "error": result.error,
         "provider_name": result.provider_name,
+        "direction": getattr(result, "direction", "both"),
     }
     Path(path).write_text(_json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
@@ -1542,6 +1599,7 @@ def _export_address_csv(result: AddressTraceResult, base_path: str) -> tuple[str
                 "tx_count",
                 "is_cex",
                 "cex_name",
+                "cex_user",
                 "is_target",
             ]
         )
@@ -1554,6 +1612,7 @@ def _export_address_csv(result: AddressTraceResult, base_path: str) -> tuple[str
                     n.tx_count,
                     n.is_cex,
                     n.cex_name,
+                    n.cex_user,
                     n.is_target,
                 ]
             )
@@ -2146,10 +2205,12 @@ def open_cmd(cache_key: str) -> None:
         if not address:
             Console().print("[red]No target address in cached trace.[/red]")
             return
+        _addr_dir = data.get("direction", "both")
         result = _cache_mod.load_address_trace(
             address,
             tx_limit=data.get("tx_limit", 0),
             max_depth=data.get("max_depth", 1),
+            direction=_addr_dir,
         )
         if result is None:
             Console().print("[red]Failed to parse cached address trace.[/red]")
@@ -2157,7 +2218,7 @@ def open_cmd(cache_key: str) -> None:
         start_address_server(
             result,
             target_address=address,
-            cache_key=_cache_mod._addr_cache_key(address),
+            cache_key=_cache_mod._addr_cache_key(address, direction=_addr_dir),
         )
 
 

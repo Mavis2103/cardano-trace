@@ -76,6 +76,9 @@ async def trace_address_interactions(
     step_callback: Optional[Callable[[str, str, Optional[str], int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     tx_cache_get: Optional[Callable[[str], Optional[dict]]] = None,
+    direction: str = "both",
+    addr_txs_cache_get: Optional[Callable[[str], set[str]]] = None,
+    addr_txs_cache_save: Optional[Callable[[str, list[str]], None]] = None,
 ) -> AddressTraceResult:
     """Trace addresses connected to *target_address*, up to *max_depth* hops.
 
@@ -148,27 +151,51 @@ async def trace_address_interactions(
             continue
 
         # ── Step 1: Fetch ALL tx hashes for this address ────────────────
-        # This call can paginate for a while; tell the UI so the progress
-        # line shows life instead of appearing to hang (UTXO-trace parity).
-        if status_callback:
-            status_callback(
-                f"fetching tx list: {current_addr[:14]}…"
-                + (f" (depth {current_depth})" if max_depth > 1 else "")
-            )
-        try:
-            tx_hashes = await asyncio.wait_for(
-                provider.get_address_transactions(current_addr),
-                timeout=timeout_per_fetch * 5,
-            )
-        except NotImplementedError as e:
-            # Provider can't do address-tx lookup — skip this address
-            errors.append(f"{current_addr[:16]}…: {e}")
-            continue
-        except Exception as e:
-            errors.append(
-                f"{current_addr[:16]}…: Failed tx fetch: {type(e).__name__}: {e}"
-            )
-            continue
+        # Cache the (expensive, paginated) tx-list per address so a repeat or
+        # deeper trace skips provider pagination entirely. Only used for the
+        # full-history case (tx_limit is None); a truncated list must not be
+        # mistaken for the complete history.
+        tx_hashes: Optional[list[str]] = None
+        if tx_limit is None and addr_txs_cache_get is not None:
+            try:
+                cached_list = addr_txs_cache_get(current_addr)
+            except Exception:
+                cached_list = None
+            if cached_list:
+                tx_hashes = list(cached_list)
+                if status_callback:
+                    status_callback(
+                        f"cache: {len(tx_hashes)} tx-list {current_addr[:14]}…"
+                    )
+
+        if tx_hashes is None:
+            # This call can paginate for a while; tell the UI so the progress
+            # line shows life instead of appearing to hang (UTXO-trace parity).
+            if status_callback:
+                status_callback(
+                    f"fetching tx list: {current_addr[:14]}…"
+                    + (f" (depth {current_depth})" if max_depth > 1 else "")
+                )
+            try:
+                tx_hashes = await asyncio.wait_for(
+                    provider.get_address_transactions(current_addr),
+                    timeout=timeout_per_fetch * 5,
+                )
+            except NotImplementedError as e:
+                # Provider can't do address-tx lookup — skip this address
+                errors.append(f"{current_addr[:16]}…: {e}")
+                continue
+            except Exception as e:
+                errors.append(
+                    f"{current_addr[:16]}…: Failed tx fetch: {type(e).__name__}: {e}"
+                )
+                continue
+            # Persist the full tx-list for cross-trace reuse.
+            if tx_hashes and tx_limit is None and addr_txs_cache_save is not None:
+                try:
+                    addr_txs_cache_save(current_addr, list(tx_hashes))
+                except Exception:
+                    pass
 
         if not tx_hashes:
             continue
@@ -257,6 +284,7 @@ async def trace_address_interactions(
                     visited_addresses,
                     max_depth,
                     count_ada=_take_ada(tx_hash),
+                    direction=direction,
                 )
 
                 if step_callback:
@@ -308,6 +336,7 @@ async def trace_address_interactions(
                     errors,
                     discovered_utxos,
                     count_ada=_take_ada(tx_hash),
+                    direction=direction,
                 )
                 has_data = bool(tx_data.get("input_utxos") or tx_data.get("outputs"))
                 tx_err = None if has_data else "empty result"
@@ -369,6 +398,7 @@ async def trace_address_interactions(
                 errors,
                 discovered_utxos,
                 count_ada=_take_ada(h),
+                direction=direction,
             )
             if step_callback:
                 step_callback(current_addr, h, None, current_depth)
@@ -425,6 +455,22 @@ async def trace_address_interactions(
         all_addrs_set.add(t)
     all_addrs_set.add(target_address)
 
+    # CEX-adjacency labeling: a non-CEX wallet that shares a DIRECT edge with a
+    # registered CEX address is tagged "<CEX> User" (e.g. "Binance User") so
+    # money in/out of the exchange is identifiable at a glance.
+    cex_addr_name: dict[str, str] = {}
+    for a in all_addrs_set:
+        ci = identify_cex(a)
+        if ci is not None:
+            cex_addr_name[a] = ci.name
+    cex_user_map: dict[str, str] = {}
+    if cex_addr_name:
+        for s, t, _tx, _d in all_edges:
+            if s in cex_addr_name and t not in cex_addr_name:
+                cex_user_map.setdefault(t, cex_addr_name[s])
+            elif t in cex_addr_name and s not in cex_addr_name:
+                cex_user_map.setdefault(s, cex_addr_name[t])
+
     seen: set[str] = set()
     nodes: list[AddressInteractionNode] = []
     for addr in sorted(all_addrs_set):
@@ -447,6 +493,7 @@ async def trace_address_interactions(
                 cex_name=cex.name if cex else "",
                 is_target=(addr == target_address),
                 depth=addr_depth.get(addr, 0),
+                cex_user="" if cex is not None else cex_user_map.get(addr, ""),
             )
         )
 
@@ -457,7 +504,7 @@ async def trace_address_interactions(
 
     edges: list[AddressInteractionEdge] = []
     for (source, target), tx_list in edge_map.items():
-        direction = _compute_direction(source, target, target_address, addr_depth)
+        edge_dir = _compute_direction(source, target, target_address, addr_depth)
         min_depth = min(d for _, d in tx_list)
         edges.append(
             AddressInteractionEdge(
@@ -465,7 +512,7 @@ async def trace_address_interactions(
                 target=target,
                 tx_hashes=[h for h, _ in tx_list],
                 interaction_count=len(tx_list),
-                direction_relative_to_target=direction,
+                direction_relative_to_target=edge_dir,
                 source_depth=min_depth,
             )
         )
@@ -493,6 +540,7 @@ async def trace_address_interactions(
         error=_format_errors(errors),
         provider_name=provider_name,
         max_depth=max_depth,
+        direction=direction,
     )
 
     # CROSS-CACHE
@@ -558,12 +606,21 @@ def _record_tx_edges(
     visited_addresses: set[str],
     max_depth: int,
     count_ada: bool = True,
+    direction: str = "both",
 ) -> None:
     """Record directed edges + ADA flow for one tx, queuing new addresses.
 
     ``count_ada`` is False when this tx's ADA was already accumulated on an
     earlier BFS encounter — edges are still recorded (deduped downstream) but
     net/gross/in/out ADA are not double-counted.
+
+    ``direction`` filters the flow followed relative to the address being
+    expanded:
+      - ``forward``  : only value LEAVING current_addr (current is a tx input →
+        follow recipients downstream).
+      - ``backward`` : only value ENTERING current_addr (current is a tx output →
+        follow senders upstream).
+      - ``both``     : both sides (default).
     """
 
     # Directed edges: input → output, keep only pairs where current_addr is one side
@@ -571,21 +628,30 @@ def _record_tx_edges(
         for out_addr in output_addrs:
             if in_addr == out_addr:
                 continue
-            if in_addr == current_addr or out_addr == current_addr:
-                all_edges.append((in_addr, out_addr, tx_hash, current_depth))
+            cur_is_input = in_addr == current_addr
+            cur_is_output = out_addr == current_addr
+            if not (cur_is_input or cur_is_output):
+                continue
+            # Direction gate (per input→output pair, so change-address txs that
+            # have current_addr on BOTH sides are still split correctly).
+            if direction == "forward" and not cur_is_input:
+                continue
+            if direction == "backward" and not cur_is_output:
+                continue
+            all_edges.append((in_addr, out_addr, tx_hash, current_depth))
 
-                # Track counterparty for BFS expansion. Skip the user's OWN
-                # change addresses (same wallet / stake key): they are not
-                # third-party counterparties, so traversing into them would
-                # inflate the graph with self-owned nodes.
-                other = out_addr if in_addr == current_addr else in_addr
-                if (
-                    other not in visited_addresses
-                    and current_depth + 1 < max_depth
-                    and not _same_wallet(other, current_addr)
-                ):
-                    visited_addresses.add(other)
-                    queue.append((other, current_depth + 1))
+            # Track counterparty for BFS expansion. Skip the user's OWN
+            # change addresses (same wallet / stake key): they are not
+            # third-party counterparties, so traversing into them would
+            # inflate the graph with self-owned nodes.
+            other = out_addr if cur_is_input else in_addr
+            if (
+                other not in visited_addresses
+                and current_depth + 1 < max_depth
+                and not _same_wallet(other, current_addr)
+            ):
+                visited_addresses.add(other)
+                queue.append((other, current_depth + 1))
 
     # Record tx membership for EVERY address in this tx on every encounter
     # (set dedups by tx_hash). Independent of count_ada so tx_count is not
@@ -664,6 +730,7 @@ def _process_tx_data_static(
     errors: list[str],
     discovered_utxos: dict[str, UTxONode],
     count_ada: bool = True,
+    direction: str = "both",
 ) -> None:
     """Process pre-fetched tx_data (batch path)."""
     _collect_utxos(tx_data, discovered_utxos)
@@ -689,6 +756,7 @@ def _process_tx_data_static(
         visited_addresses,
         max_depth,
         count_ada=count_ada,
+        direction=direction,
     )
 
 
@@ -849,4 +917,5 @@ def apply_cex_filter(result: AddressTraceResult) -> AddressTraceResult:
         error=result.error,
         provider_name=result.provider_name,
         max_depth=result.max_depth,
+        direction=result.direction,
     )
