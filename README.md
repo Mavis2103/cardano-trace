@@ -73,6 +73,39 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 | `--use-proxy` | flag | off |
 | `--proxy-url` | URL | http://localhost:3001 |
 
+### Trace Address CLI Options
+
+The `trace-address` subcommand traces ALL addresses that share a transaction
+with a given Cardano address (vs. `trace` which follows a single UTXO).
+Useful for "who does this address interact with" investigations.
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--provider` | blockfrost, koios, maestro, kupmios, utxorpc | auto-detect |
+| `--max-depth` | integer | 1 (direct interactions only) |
+| `--tx-limit` | integer | 0 (all transactions) |
+| `--output` | table, json, csv | table |
+| `--cex-file` | JSON file path | — |
+| `--cex-filter` | flag | off (show all interactions) |
+| `--no-cache` | flag | off (cached) |
+
+#### `--cex-filter` (large-graph reduction)
+
+When a trace produces many addresses, use `--cex-filter` to keep only
+the subgraph that lies on a path from the target to any registered
+CEX address. Non-CEX branches and unrelated counterparties are dropped
+(post-filter, the unfiltered result is still cached so you can re-run
+without the flag).
+
+Use case: scanning a 200-address trace for CEX exposure should return
+a focused subgraph, not the whole trace.
+
+Example: `TARGET ─── A1, A2, A3 (unrelated) ─── X1 ─── X2 ─── BINANCE`
+→ with `--cex-filter`: keeps only `TARGET → X1 → X2 → BINANCE`.
+
+If the trace's max depth doesn't reach any CEX, the filter shows only
+the target (and prints a hint to increase `--max-depth`).
+
 ### CEX Detection
 | Feature | Description |
 |---------|-------------|
@@ -80,6 +113,7 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 | **Custom registry** | Load addresses from JSON file (dict or list format) |
 | **Confidence levels** | High / medium / low per entry |
 | **Detection outputs** | Summary panel, node table, depth tree, dedicated CEX findings table, graph visualization |
+| **CEX filter** | `--cex-filter` on `trace-address` reduces a large graph to only the CEX-touching branches |
 
 ### Visualization (Dash Cytoscape)
 | Feature | Description |

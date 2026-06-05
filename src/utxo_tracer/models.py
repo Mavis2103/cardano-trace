@@ -49,6 +49,9 @@ class UTxONode:
     inline_datum: Optional[Any] = None
     script_ref: Optional[str] = None
 
+    # Internal cache for address_type — computed once on first access
+    _address_type_cache: Optional[str] = None
+
     @property
     def lovelace(self) -> int:
         for a in self.assets:
@@ -62,9 +65,15 @@ class UTxONode:
 
     @property
     def address_type(self) -> str:
-        """Classify the address as 'wallet', 'script', 'byron', 'stake', or 'unknown'."""
-        from .utils import classify_address
-        return classify_address(self.address).value
+        """Classify the address as 'wallet', 'script', 'byron', 'stake', or 'unknown'.
+
+        Result is memoized on the node so ``classify_address()`` is only
+        called once per node instance.
+        """
+        if self._address_type_cache is None:
+            from .utils import classify_address
+            object.__setattr__(self, '_address_type_cache', classify_address(self.address).value)
+        return self._address_type_cache  # type: ignore[return-value]
 
 
 @dataclass

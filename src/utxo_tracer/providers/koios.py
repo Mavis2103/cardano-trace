@@ -16,6 +16,8 @@ _LOGGER = logging.getLogger(__name__)
 
 class KoiosProvider(Provider):
     provider_type = "koios"
+    supports_batch_tx_fetch = True  # real /tx_info batch endpoint (100 tx/call)
+    supports_forward = True
 
     def __init__(
         self,
@@ -255,3 +257,31 @@ class KoiosProvider(Provider):
                 continue
 
         return spent_refs
+
+    async def get_address_spend_map(self, address: str) -> dict[str, str]:
+        """UTXO-precise spend map: consumed-input node_id -> spending tx_hash.
+
+        Uses Koios batch ``/tx_info`` (100 tx/call) to resolve every tx at the
+        address, recording which tx consumed each input owned by this address.
+        """
+        spend_map: dict[str, str] = {}
+        try:
+            tx_hashes = await self.get_address_transactions(address)
+        except Exception:
+            return spend_map
+
+        BATCH = 100
+        for i in range(0, len(tx_hashes), BATCH):
+            chunk = tx_hashes[i : i + BATCH]
+            try:
+                tx_datas = await self.get_transactions_utxos(chunk)
+            except Exception:
+                continue
+            for tx_hash, tx_data in zip(chunk, tx_datas):
+                input_utxos: dict = tx_data.get("input_utxos", {})
+                for inp in tx_data.get("inputs", []):
+                    nid = inp.node_id()
+                    node = input_utxos.get(nid)
+                    if node is None or node.address == address:
+                        spend_map[nid] = tx_hash
+        return spend_map

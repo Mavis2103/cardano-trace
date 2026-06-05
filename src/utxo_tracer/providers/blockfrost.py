@@ -13,6 +13,7 @@ from .base import Provider
 
 class BlockfrostProvider(Provider):
     provider_type = "blockfrost"
+    supports_forward = True
 
     def __init__(
         self,
@@ -227,3 +228,41 @@ class BlockfrostProvider(Provider):
                 continue
 
         return spent_refs
+
+    async def get_address_spend_map(self, address: str) -> dict[str, str]:
+        """UTXO-precise spend map: consumed-input node_id -> spending tx_hash.
+
+        Scans every transaction involving the address and, for each input that
+        belonged to this address, records which transaction consumed it. Only
+        inputs owned by ``address`` are kept so the map stays small and precise.
+        """
+        spend_map: dict[str, str] = {}
+        try:
+            tx_hashes = await self.get_address_transactions(address)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise
+            return spend_map
+        except Exception:
+            return spend_map
+
+        for tx_hash in tx_hashes:
+            try:
+                tx_data = await self.get_transaction_utxos(tx_hash)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    raise
+                continue
+            except Exception:
+                continue
+            input_utxos: dict = tx_data.get("input_utxos", {})
+            for inp in tx_data.get("inputs", []):
+                nid = inp.node_id()
+                node = input_utxos.get(nid)
+                # Only inputs OWNED by this address were UTXOs sitting here that
+                # got spent by tx_hash. (If we can't resolve the owner, keep it —
+                # being permissive never produces a wrong forward edge because
+                # forward only looks up node_ids it actually traced.)
+                if node is None or node.address == address:
+                    spend_map[nid] = tx_hash
+        return spend_map

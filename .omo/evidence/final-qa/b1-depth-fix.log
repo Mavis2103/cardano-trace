@@ -1,8 +1,0 @@
-B1 Depth Fix Verification:
-addr1qx7lzh4zew0pen6... depth=0 target=True
-addr1q8ys3h38yzl0fh0... depth=1 target=False
-addr1q9x2y3z4a5b6c7d... depth=1 target=False
-
-Assertion: depths == [0, 1, 1]
-Result: B1 depth fix: OK
-PASS

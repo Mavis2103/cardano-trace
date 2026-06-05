@@ -11,7 +11,6 @@ import sys
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from threading import Timer
 from typing import Any, NoReturn, Optional
 
 from . import cache as cache_mod
@@ -35,7 +34,7 @@ from .models import Asset, OutRef, TraceResult, TraceStep, TransactionEdge, UTxO
 from .providers import build_provider
 from .providers.base import Provider
 from .providers.fallback import FallbackProvider as _FallbackProvider
-from .tracing import build_graph_from_steps, trace_backward, trace_forward
+from .tracing import apply_cex_filter, build_graph_from_steps, trace_backward, trace_forward
 from .utils import lovelace_to_ada, parse_out_ref, shorten
 
 from ._rich_tty import LiveProgress
@@ -60,15 +59,6 @@ def _fmt_ts(ts: int) -> str:
         return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
     except (OSError, ValueError, OverflowError):
         return str(ts)
-
-
-def _open_browser() -> None:
-    import webbrowser
-
-    try:
-        webbrowser.open("http://127.0.0.1:8050")
-    except Exception:
-        pass
 
 
 def _dataclass_to_dict(obj: Any) -> Any:
@@ -450,7 +440,7 @@ async def _run_trace(
     task_id,
     cached_nodes: Optional[dict[str, UTxONode]] = None,
     cached_inputs: Optional[dict[str, list[str]]] = None,
-    cached_outputs: Optional[dict[str, list[str]]] = None,
+    cached_spend_map: Optional[dict[str, str]] = None,
     store: Optional[dict] = None,
     store_module=None,
     trace_key: str = "",
@@ -466,7 +456,7 @@ async def _run_trace(
                 start,
                 max_depth=max_depth,
                 cached_nodes=cached_nodes,
-                cached_outputs=cached_outputs,
+                cached_spend_map=cached_spend_map,
             )
         else:
             gen = trace_backward(
@@ -552,12 +542,17 @@ async def _do_trace(
 ) -> TraceResult:
     from . import cache as _cache_mod
 
-    _cached_nodes, _cached_inputs, _cached_outputs = _cache_mod._store_to_models(None)
+    (
+        _cached_nodes,
+        _cached_inputs,
+        _cached_outputs,
+        _cached_spend_map,
+    ) = _cache_mod._store_to_models(None)
     if _cached_nodes:
         console.print(
             f"[dim]Store: {len(_cached_nodes)} cached nodes, "
             f"{sum(len(v) for v in _cached_inputs.values())} backward edges, "
-            f"{sum(len(v) for v in _cached_outputs.values())} forward edges[/dim]"
+            f"{len(_cached_spend_map)} forward spends[/dim]"
         )
     store = None  # SQLite handles persistence directly
     with LiveProgress(
@@ -580,7 +575,6 @@ async def _do_trace(
                 task,
                 cached_nodes=_cached_nodes,
                 cached_inputs=_cached_inputs,
-                cached_outputs=_cached_outputs,
                 store=store,
                 store_module=_cache_mod,
                 trace_key=trace_key,
@@ -597,7 +591,7 @@ async def _do_trace(
                 progress,
                 task,
                 cached_nodes=_cached_nodes,
-                cached_outputs=_cached_outputs,
+                cached_spend_map=_cached_spend_map,
                 store=store,
                 store_module=_cache_mod,
                 trace_key=trace_key,
@@ -778,7 +772,7 @@ def trace_cmd(
                     cached_result = cache_mod.load_trace(start, direction, max_depth)
                     if cached_result is not None:
                         console.print("[green]Loaded from local cache[/green]")
-                        from .graph.dash_app import start_server
+                        from .graph.g6_viz import start_server
 
                         ck = cache_mod._cache_key(start, direction, max_depth)
                         start_server(cached_result, start_out_ref=start, cache_key=ck)
@@ -809,7 +803,7 @@ def trace_cmd(
                     )
                 else:
                     console.print("[green]Loaded from local cache[/green]")
-                    from .graph.dash_app import start_server
+                    from .graph.g6_viz import start_server
 
                     ck = cache_mod._cache_key(start, direction, max_depth)
                     start_server(cached_result, start_out_ref=start, cache_key=ck)
@@ -879,11 +873,11 @@ def trace_cmd(
         n_path, e_path = _export_csv(result, export_csv)
         console.print(f"[green]Exported nodes CSV:[/green] {n_path}")
         console.print(f"[green]Exported edges CSV:[/green] {e_path}")
-    from .graph.dash_app import start_server
+    from .graph.g6_viz import start_server
 
     if dash:
         console.print("[green]Starting graph visualization...[/green]")
-        Timer(1.5, _open_browser).start()
+        # browser is opened by the g6 viz server on its actual port
         ck = cache_mod._cache_key(start, direction, max_depth) if not no_cache else ""
         start_server(result, start_out_ref=start, cache_key=ck, cashflow_summary=None)
     else:
@@ -934,6 +928,14 @@ def trace_cmd(
 @click.option("--export-csv", type=click.Path(), default=None)
 @click.option("--fallback/--no-fallback", default=True)
 @click.option("--cex-file", type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option(
+    "--cex-filter/--no-cex-filter",
+    default=False,
+    help="Filter output to only addresses that interact with the target AND "
+    "are reachable from a registered CEX address in the trace graph. "
+    "Useful when the full trace is large; use a higher --max-depth if no "
+    "CEXs are discovered (filter will keep only the target).",
+)
 @click.option("--dash/--no-dash", default=True, hidden=True)
 @click.option("--use-proxy/--no-proxy", default=False)
 @click.option("--proxy-url", type=str, default="http://localhost:3001")
@@ -959,6 +961,7 @@ def trace_address_cmd(
     export_csv,
     fallback,
     cex_file,
+    cex_filter,
     dash,
     use_proxy,
     proxy_url,
@@ -982,8 +985,6 @@ def trace_address_cmd(
             err_console.print(f"[yellow]Warning loading CEX file:[/yellow] {e}")
 
     # --- cache check (manifest + v2 snapshot, depth-adaptive) ---
-    skip_tx_hashes: dict[str, set[str]] = {}
-    cached_tx_count = 0  # for end-of-run cached/live summary
     # Normalize tx_limit: None (not specified) → 0 (all transactions)
     effective_tx_limit = tx_limit if tx_limit is not None else 0
 
@@ -1008,37 +1009,45 @@ def trace_address_cmd(
                 if cached is not None:
                     console.print("[green]Loaded from local cache[/green]")
                     result = cached
+                    if cex_filter and result.addresses:
+                        n_before = len(result.addresses)
+                        result = apply_cex_filter(result)
+                        _print_cex_filter_banner(n_before, len(result.addresses))
                     if dash and result.addresses:
-                        from .graph.address_dash_app import start_address_server
+                        from .graph.g6_viz import start_address_server
 
                         console.print("[green]Starting graph visualization...[/green]")
-                        Timer(1.5, _open_browser).start()
-                        start_address_server(result, target_address=address)
+                        # browser is opened by the g6 viz server on its actual port
+                        start_address_server(
+                            result,
+                            target_address=address,
+                            cache_key=cache_mod._addr_cache_key(address),
+                        )
                     else:
                         _print_address_summary(result)
                         _print_address_nodes_table(result)
                         _print_address_interaction_edges(result)
                     return
-                # No v2 snapshot — rebuild from manifest
+                # No v2 snapshot — rebuild from manifest. Cache-serve replays
+                # every already-fetched tx from the global store for free, so
+                # the rebuilt result is complete (no provider re-query of the
+                # cached txs).
                 cache_mod.finalize_address_trace(address, max_depth)
                 n_ok = len(cached_partial.processed)
                 n_fail = len(cached_partial.failed)
-                skip_tx_hashes = cached_partial.processed_by_addr or {}
-                cached_tx_count = n_ok
                 if n_fail:
                     console.print(
-                        f"[yellow]Cache: {n_ok} OK, {n_fail} failed — re-query[/yellow]"
+                        f"[yellow]Cache: {n_ok} OK, {n_fail} failed — re-query failed[/yellow]"
                     )
                 else:
                     console.print(
-                        "[green]Cache: per-step manifest — rebuilding[/green]"
+                        "[green]Cache: per-step manifest — rebuilding from cache[/green]"
                     )
             else:
-                # Partial or needs extension — skip processed txs, query remainder
+                # Partial / extension — cached txs are served from the store,
+                # only missing or previously-failed txs hit the provider.
                 n_ok = len(cached_partial.processed)
                 n_fail = len(cached_partial.failed)
-                skip_tx_hashes = cached_partial.processed_by_addr or {}
-                cached_tx_count = n_ok
 
                 if needs_extend:
                     msg = (
@@ -1061,12 +1070,20 @@ def trace_address_cmd(
             if cached is not None:
                 console.print("[green]Loaded from local cache[/green]")
                 result = cached
+                if cex_filter and result.addresses:
+                    n_before = len(result.addresses)
+                    result = apply_cex_filter(result)
+                    _print_cex_filter_banner(n_before, len(result.addresses))
                 if dash and result.addresses:
-                    from .graph.address_dash_app import start_address_server
+                    from .graph.g6_viz import start_address_server
 
                     console.print("[green]Starting graph visualization...[/green]")
-                    Timer(1.5, _open_browser).start()
-                    start_address_server(result, target_address=address)
+                    # browser is opened by the g6 viz server on its actual port
+                    start_address_server(
+                        result,
+                        target_address=address,
+                        cache_key=cache_mod._addr_cache_key(address),
+                    )
                 else:
                     _print_address_summary(result)
                     _print_address_nodes_table(result)
@@ -1094,9 +1111,12 @@ def trace_address_cmd(
         async with prov as p:
             # Load store (identical to UTXO trace — _do_trace())
             _store = None
-            _cached_nodes, _cached_inputs, _cached_outputs = cache_mod._store_to_models(
-                None
-            )
+            (
+                _cached_nodes,
+                _cached_inputs,
+                _cached_outputs,
+                _cached_spend_map,
+            ) = cache_mod._store_to_models(None)
             if _cached_nodes:
                 console.print(
                     f"[dim]Store: {len(_cached_nodes)} cached nodes, "
@@ -1163,6 +1183,17 @@ def trace_address_cmd(
                     progress.update(progress_task_id, advance=1, description=desc)
                 progress.refresh()
 
+            def _status_callback(msg: str) -> None:
+                """Show phase messages (e.g. paginating an address's tx list)
+                so the bar shows life before the first tx lands."""
+                nonlocal progress_task_id
+                desc = f"[cyan]address[/cyan] [dim]{msg}[/dim]"
+                if progress_task_id is None:
+                    progress_task_id = progress.add_task(desc, total=None)
+                else:
+                    progress.update(progress_task_id, description=desc)
+                progress.refresh()
+
             progress = LiveProgress(
                 SpinnerColumn(),
                 TextColumn("{task.description}"),
@@ -1173,27 +1204,29 @@ def trace_address_cmd(
             progress_task_id = None
 
             with progress:
+                # Serve already-cached txs from the global store; only
+                # missing/failed txs hit the provider. This replaces the old
+                # skip_tx_hashes approach (which dropped cached edges from the
+                # rebuilt result and could overwrite a good snapshot with a
+                # partial one). Now every tx is processed — cached or live — so
+                # the result is always complete and safe to persist.
                 result = await trace_address_interactions(
                     p,
                     address,
                     max_depth=max_depth,
                     tx_limit=tx_limit,
-                    skip_tx_hashes=skip_tx_hashes if skip_tx_hashes else None,
                     step_callback=_step_callback,
+                    status_callback=_status_callback,
+                    tx_cache_get=(None if no_cache else cache_mod.get_transaction),
                 )
 
-            # End-of-run cached/live summary (identical to UTXO trace)
-            n_live = _processed_count  # works for both batch + concurrent paths
-            n_cached = cached_tx_count
-            if n_cached:
+            # End-of-run summary. _processed_count counts every tx handled
+            # this run — cached (served instantly) + live (provider). The
+            # cache/provider split is shown live via _status_callback.
+            n_total = _processed_count
+            if n_total:
                 console.print(
-                    f"[dim]address: {n_cached} cached + "
-                    f"{n_live} new = {n_cached + n_live} tx(s)"
-                    f"{'' if not result.error else ', errors present'}[/dim]"
-                )
-            elif n_live:
-                console.print(
-                    f"[dim]address: {n_live} tx(s)"
+                    f"[dim]address: {n_total} tx(s) processed"
                     f"{'' if not result.error else ', errors present'}[/dim]"
                 )
 
@@ -1211,19 +1244,27 @@ def trace_address_cmd(
         err_console.print("[yellow]Trace interrupted[/yellow]")
         sys.exit(130)
 
+    # Apply CEX filter AFTER the trace completes (so the unfiltered
+    # result is what gets saved to cache). This way re-running with or
+    # without --cex-filter on the same cache gives consistent results.
+    if cex_filter and result.addresses:
+        n_before = len(result.addresses)
+        result = apply_cex_filter(result)
+        _print_cex_filter_banner(n_before, len(result.addresses))
+
     if not no_cache:
-        # Only save v2 snapshot if we got actual data — don't overwrite
-        # a good cache with an empty result (e.g. extension hit rate-limit).
-        if result.edges:
+        # Save when the trace produced real data — including a legitimate
+        # zero-counterparty result (addresses present, no edges). Only skip on
+        # an outright failure (error, or not even the target node resolved),
+        # so a rate-limited extension doesn't clobber a good cache.
+        if result.addresses and not result.error:
             cache_mod.save_address_trace(
                 result, tx_limit=effective_tx_limit, max_depth=max_depth
             )
             cache_mod.finalize_address_trace(address, max_depth)
         else:
             logger.info(
-                "Skipping v2 snapshot save (no edges) — "
-                "manifest has %d processed tx(s)",
-                len(skip_tx_hashes) if skip_tx_hashes else 0,
+                "Skipping v2 snapshot save (no edges) — keeping prior snapshot"
             )
 
     if output == "json":
@@ -1242,11 +1283,15 @@ def trace_address_cmd(
         _export_address_csv(result, export_csv)
 
     if dash and result.addresses:
-        from .graph.address_dash_app import start_address_server
+        from .graph.g6_viz import start_address_server
 
         console.print("[green]Starting graph visualization...[/green]")
-        Timer(1.5, _open_browser).start()
-        start_address_server(result, target_address=address)
+        # browser is opened by the g6 viz server on its actual port
+        start_address_server(
+            result,
+            target_address=address,
+            cache_key=cache_mod._addr_cache_key(address),
+        )
     else:
         console.print("[green]Trace complete — use --dash to view graph[/green]")
 
@@ -1282,6 +1327,36 @@ def _print_address_summary(result: AddressTraceResult) -> None:
         border_style="cyan",
     )
     console.print(panel)
+
+
+def _print_cex_filter_banner(n_before: int, n_after: int) -> None:
+    """Print one-line banner after CEX filter is applied.
+
+    Called by the CLI right after ``apply_cex_filter()`` so the user sees
+    both how much the graph was reduced and a hint if nothing useful was
+    kept. The summary panel below will show the CEX count for the kept
+    set, so this banner only needs the count delta.
+    """
+    if n_after == 0:
+        console.print(
+            "[yellow]CEX filter: kept 0 addresses (empty trace).[/yellow]"
+        )
+    elif n_after == 1:
+        console.print(
+            f"[yellow]CEX filter: kept 1/{n_before} address — only the "
+            f"target. No CEX reachable in this graph; try a higher "
+            f"--max-depth to discover exchanges.[/yellow]"
+        )
+    elif n_after < n_before:
+        console.print(
+            f"[cyan]CEX filter: kept {n_after}/{n_before} addresses "
+            f"(hidden {n_before - n_after} non-CEX-related).[/cyan]"
+        )
+    else:
+        console.print(
+            f"[cyan]CEX filter: kept {n_after}/{n_before} addresses "
+            f"(all reached a registered CEX).[/cyan]"
+        )
 
 
 def _print_address_nodes_table(result: AddressTraceResult) -> None:
@@ -2024,7 +2099,7 @@ def cache_info() -> None:
 @click.argument("cache_key")
 def open_cmd(cache_key: str) -> None:
     """Open a cached trace visualization from SQLite."""
-    from .graph.dash_app import start_server
+    from .graph.g6_viz import start_server
 
     # Find trace in SQLite by scanning snapshots
     conn = cache_mod._get_db()
@@ -2064,7 +2139,7 @@ def open_cmd(cache_key: str) -> None:
             return
         start_server(result, start_out_ref=start_ref, cache_key=cache_key)
     elif trace_type == "address":
-        from .graph.address_dash_app import start_address_server
+        from .graph.g6_viz import start_address_server
         from . import cache as _cache_mod
 
         address = metadata.get("target_address", "")
@@ -2079,7 +2154,11 @@ def open_cmd(cache_key: str) -> None:
         if result is None:
             Console().print("[red]Failed to parse cached address trace.[/red]")
             return
-        start_address_server(result, target_address=address)
+        start_address_server(
+            result,
+            target_address=address,
+            cache_key=_cache_mod._addr_cache_key(address),
+        )
 
 
 # CEX cashflow commands

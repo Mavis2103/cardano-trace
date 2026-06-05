@@ -65,14 +65,24 @@ async def trace_backward(
 
         if step.error or step.utxo is None:
             continue
+        if depth >= max_depth:
+            continue  # leaf at the depth cap — don't fetch its inputs/tx
 
-        # Best-effort input_utxos pre-cache: even when cached_inputs exists,
-        # try to fetch TX data to pre-cache nodes missing from cached_nodes.
-        if (
+        # Best-effort input_utxos pre-cache: only when cached_inputs lists
+        # source nodes we DON'T already have data for. Without this guard a
+        # full cache hit (smaller-depth re-trace, every input already cached)
+        # would still fire one provider tx-fetch per node — defeating the
+        # "smaller depth = no provider" requirement.
+        _missing_inputs = (
             cached_nodes is not None
             and cached_inputs
             and out_ref.node_id() in cached_inputs
-        ):
+            and any(
+                src_id not in cached_nodes
+                for src_id in cached_inputs[out_ref.node_id()]
+            )
+        )
+        if _missing_inputs:
             try:
                 tx_data = await asyncio.wait_for(
                     provider.get_transaction_utxos(out_ref.tx_hash),

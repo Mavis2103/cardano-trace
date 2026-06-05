@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 class KupmiosProvider(Provider):
     provider_type = "kupmios"
+    supports_forward = True
 
     def __init__(
         self,
@@ -217,3 +218,31 @@ class KupmiosProvider(Provider):
         except Exception as e:
             logger.debug("get_spent_utxos failed for %s: %s", address[:20], e)
             return []
+
+    async def get_address_spend_map(self, address: str) -> dict[str, str]:
+        """UTXO-precise spend map: consumed-input node_id -> spending tx_hash.
+
+        Kupo's ``?spent`` filter returns each spent UTXO at the address with its
+        own ``transaction_id``/``output_index`` (the consumed UTXO) and
+        ``spent_at.transaction_id`` (the spender). One request, exact mapping.
+        """
+        spend_map: dict[str, str] = {}
+        try:
+            r = await self._kupo.get(f"/matches/{address}", params={"spent": ""})
+            if r.status_code == 404:
+                return spend_map
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                for m in data:
+                    spent_at = m.get("spent_at") or {}
+                    spender = spent_at.get("transaction_id", "")
+                    utxo_tx = m.get("transaction_id", "")
+                    utxo_idx = m.get("output_index")
+                    if spender and utxo_tx and utxo_idx is not None:
+                        nid = f"{utxo_tx}:{int(utxo_idx)}"
+                        spend_map[nid] = spender
+            return spend_map
+        except Exception as e:
+            logger.debug("get_address_spend_map failed for %s: %s", address[:20], e)
+            return spend_map

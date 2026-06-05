@@ -36,9 +36,28 @@ from ..models import (
     UTxONode,
 )
 from ..providers.base import Provider
-from ..utils import classify_address
+from ..utils import address_stake_key, classify_address
 
 logger = logging.getLogger(__name__)
+
+# stake-key cache so same-wallet (change-address) checks stay cheap
+_stake_cache: dict[str, Optional[str]] = {}
+
+
+def _same_wallet(a: str, b: str) -> bool:
+    """True if two addresses share a non-None stake key (same wallet).
+
+    Used to recognise a user's OWN change addresses so they are not counted as
+    third-party counterparties (which inflates the forward interaction set).
+    """
+    if a == b:
+        return True
+    if a not in _stake_cache:
+        _stake_cache[a] = address_stake_key(a)
+    if b not in _stake_cache:
+        _stake_cache[b] = address_stake_key(b)
+    sa, sb = _stake_cache[a], _stake_cache[b]
+    return sa is not None and sa == sb
 
 _TIMEOUT_PER_FETCH = 15.0
 _BATCH_SIZE = 20
@@ -55,6 +74,8 @@ async def trace_address_interactions(
     progress_callback: Optional[Callable[[int, int], Awaitable[None]]] = None,
     skip_tx_hashes: Optional[dict[str, set[str]]] = None,
     step_callback: Optional[Callable[[str, str, Optional[str], int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    tx_cache_get: Optional[Callable[[str], Optional[dict]]] = None,
 ) -> AddressTraceResult:
     """Trace addresses connected to *target_address*, up to *max_depth* hops.
 
@@ -83,6 +104,13 @@ async def trace_address_interactions(
         Called after each tx is processed with
         ``(source_address, tx_hash, error_or_None, depth)``.
         Use for per-step cache saving.
+    tx_cache_get:
+        ``tx_hash -> tx_data | None`` lookup into the global tx cache. When it
+        returns a populated dict (``input_utxos`` or ``outputs`` present) the
+        tx is processed from cache with NO provider call. Only genuinely
+        missing (or previously-failed, hence uncached) txs hit the provider.
+        This is what makes a smaller-depth (or repeat) trace serve entirely
+        from cache, and a larger-depth trace reuse everything already seen.
     """
     provider_name = getattr(provider, "current_provider", "") or getattr(
         provider, "provider_type", ""
@@ -105,6 +133,12 @@ async def trace_address_interactions(
     discovered_utxos: dict[str, UTxONode] = {}
     total_tx_processed = 0
     per_addr_tx_count: dict[str, int] = defaultdict(int)
+    # ADA accumulators must count each tx exactly once. The same tx can be
+    # re-encountered when expanding a counterparty at a deeper BFS level; only
+    # the first encounter contributes to net/gross/in/out ADA (edges are still
+    # recorded every time, then deduped later by (source,target)).
+    ada_counted_txs: set[str] = set()
+    truncated = False  # set if the _MAX_ADDRESSES safety cap was hit
 
     # ── BFS loop ─────────────────────────────────────────────────────────
     while queue:
@@ -114,6 +148,13 @@ async def trace_address_interactions(
             continue
 
         # ── Step 1: Fetch ALL tx hashes for this address ────────────────
+        # This call can paginate for a while; tell the UI so the progress
+        # line shows life instead of appearing to hang (UTXO-trace parity).
+        if status_callback:
+            status_callback(
+                f"fetching tx list: {current_addr[:14]}…"
+                + (f" (depth {current_depth})" if max_depth > 1 else "")
+            )
         try:
             tx_hashes = await asyncio.wait_for(
                 provider.get_address_transactions(current_addr),
@@ -161,13 +202,22 @@ async def trace_address_interactions(
             logger.warning(
                 "Reached %d address limit — stopping expansion", _MAX_ADDRESSES
             )
+            truncated = True
             break
 
         # ── Step 2: Fetch tx details — try batch, fall back to concurrent ─
         sem = asyncio.Semaphore(10)
+        level_done = [0]  # txs completed at THIS address level (monotonic)
+
+        def _take_ada(tx_hash: str) -> bool:
+            """First-encounter guard so a tx's ADA is counted exactly once."""
+            if tx_hash in ada_counted_txs:
+                return False
+            ada_counted_txs.add(tx_hash)
+            return True
 
         async def _examine_tx(tx_hash: str) -> None:
-            """Fetch one tx and record edges + ADA flow."""
+            """Fetch one tx and record edges + ADA flow (per-tx fallback path)."""
             nonlocal discovered_utxos
             async with sem:
                 tx_error: Optional[str] = None
@@ -185,15 +235,10 @@ async def trace_address_interactions(
 
                 # Cross-cache: save tx data so any trace type can reuse it
                 save_transaction(tx_hash, tx_data)
-
-                # CROSS-CACHE
                 _collect_utxos(tx_data, discovered_utxos)
 
-                # Extract input/output addresses with ADA
                 input_addrs = _extract_input_addrs(tx_data)
                 output_addrs = _extract_output_addrs(tx_data)
-
-                # Record directed edges
                 _record_tx_edges(
                     tx_hash,
                     current_addr,
@@ -211,84 +256,165 @@ async def trace_address_interactions(
                     queue,
                     visited_addresses,
                     max_depth,
+                    count_ada=_take_ada(tx_hash),
                 )
 
                 if step_callback:
                     step_callback(current_addr, tx_hash, None, current_depth)
 
-        # ── Try batch API — split into sub-batches ───────────────────────────
-        batch_idx = 0
-        chunk_size = max(20, _BATCH_SIZE)
-        try:
-            for chunk_start in range(0, len(tx_hashes), chunk_size):
-                chunk = tx_hashes[chunk_start : chunk_start + chunk_size]
-                batch_results = await asyncio.wait_for(
-                    provider.get_transactions_utxos(chunk),
-                    timeout=timeout_per_fetch * (len(chunk) + 2),
-                )
-                for offset, (tx_hash, tx_data) in enumerate(zip(chunk, batch_results)):
-                    global_idx = chunk_start + offset
-                    save_transaction(tx_hash, tx_data)
-                    _process_tx_data_static(
-                        tx_hash,
-                        current_addr,
-                        current_depth,
-                        tx_data,
-                        all_edges,
-                        addr_tx_map,
-                        addr_net_ada,
-                        addr_gross_ada,
-                        addr_incoming_ada,
-                        addr_outgoing_ada,
-                        addr_type,
-                        addr_depth,
-                        queue,
-                        visited_addresses,
-                        max_depth,
-                        errors,
-                        discovered_utxos,
-                    )
-                    has_data = bool(
-                        tx_data.get("input_utxos") or tx_data.get("outputs")
-                    )
-                    tx_err = None if has_data else "empty result"
-                    if not has_data:
-                        errors.append(
-                            f"{current_addr[:16]}…: {tx_hash[:16]}…: {tx_err}"
-                        )
-                    if step_callback:
-                        step_callback(current_addr, tx_hash, tx_err, current_depth)
-
-                    if global_idx % 10 == 0:
-                        await asyncio.sleep(0)
-
-                    if progress_callback:
-                        await progress_callback(global_idx + 1, effective_count)
-                batch_idx += 1
-        except (NotImplementedError, Exception) as exc:
-            # Fall back to concurrent single-tx
-            if not isinstance(exc, NotImplementedError):
-                logger.debug(
-                    "Batch failed for %s depth=%d: %s — fallback to concurrent",
-                    current_addr[:16],
-                    current_depth,
-                    exc,
-                )
-
-            tasks = [asyncio.create_task(_examine_tx(tx_hash)) for tx_hash in tx_hashes]
+        async def _run_concurrent_single() -> None:
+            """Per-tx concurrent fetch — streams progress as each completes."""
+            tasks = [asyncio.create_task(_examine_tx(h)) for h in tx_hashes]
             completed = 0
             pending: set[asyncio.Task] = set(tasks)
             while pending:
                 done, pending = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
+                    pending, return_when=asyncio.FIRST_COMPLETED
                 )
                 completed += len(done)
-                await asyncio.sleep(
-                    0
-                )  # yield to event loop so Rich progress can render
+                await asyncio.sleep(0)  # yield so Rich progress can render
                 if progress_callback:
                     await progress_callback(completed, effective_count)
+
+        async def _process_chunk(chunk: list[str]) -> None:
+            """Fetch one batch chunk and process its txs.
+
+            Raises ``NotImplementedError`` (no batch support) straight through
+            so the caller can fall back to per-tx fetching.
+            """
+            async with sem:
+                batch_results = await asyncio.wait_for(
+                    provider.get_transactions_utxos(chunk),
+                    timeout=timeout_per_fetch * (len(chunk) + 2),
+                )
+            for tx_hash, tx_data in zip(chunk, batch_results):
+                save_transaction(tx_hash, tx_data)
+                _process_tx_data_static(
+                    tx_hash,
+                    current_addr,
+                    current_depth,
+                    tx_data,
+                    all_edges,
+                    addr_tx_map,
+                    addr_net_ada,
+                    addr_gross_ada,
+                    addr_incoming_ada,
+                    addr_outgoing_ada,
+                    addr_type,
+                    addr_depth,
+                    queue,
+                    visited_addresses,
+                    max_depth,
+                    errors,
+                    discovered_utxos,
+                    count_ada=_take_ada(tx_hash),
+                )
+                has_data = bool(tx_data.get("input_utxos") or tx_data.get("outputs"))
+                tx_err = None if has_data else "empty result"
+                if not has_data:
+                    errors.append(f"{current_addr[:16]}…: {tx_hash[:16]}…: {tx_err}")
+                if step_callback:
+                    step_callback(current_addr, tx_hash, tx_err, current_depth)
+                # Increment + report with NO await between them so the count
+                # stays strictly monotonic even across concurrent chunks.
+                level_done[0] += 1
+                if progress_callback:
+                    await progress_callback(level_done[0], effective_count)
+                await asyncio.sleep(0)  # let Rich render between txs
+
+        # ── Cache-serve pass ────────────────────────────────────────────
+        # Split this level's txs into cached (already in the global tx store)
+        # and uncached. Cached txs are processed with NO provider call, so a
+        # smaller-depth / repeat trace replays instantly from cache and a
+        # larger-depth trace only spends provider quota on genuinely new txs.
+        cached_pairs: list[tuple[str, dict]] = []
+        uncached: list[str] = list(tx_hashes)
+        if tx_cache_get is not None:
+            uncached = []
+            for h in tx_hashes:
+                try:
+                    cd = tx_cache_get(h)
+                except Exception:
+                    cd = None
+                # Require input_utxos: address edges are input→output, so a
+                # cached tx missing its input side would silently under-count
+                # edges. Such txs are re-fetched from the provider instead.
+                if cd and cd.get("input_utxos") and cd.get("outputs"):
+                    cached_pairs.append((h, cd))
+                else:
+                    uncached.append(h)
+
+        if cached_pairs and status_callback:
+            status_callback(
+                f"cache: {len(cached_pairs)} tx"
+                + (f", {len(uncached)} via provider" if uncached else "")
+            )
+        for h, cd in cached_pairs:
+            _process_tx_data_static(
+                h,
+                current_addr,
+                current_depth,
+                cd,
+                all_edges,
+                addr_tx_map,
+                addr_net_ada,
+                addr_gross_ada,
+                addr_incoming_ada,
+                addr_outgoing_ada,
+                addr_type,
+                addr_depth,
+                queue,
+                visited_addresses,
+                max_depth,
+                errors,
+                discovered_utxos,
+                count_ada=_take_ada(h),
+            )
+            if step_callback:
+                step_callback(current_addr, h, None, current_depth)
+            level_done[0] += 1
+            if progress_callback:
+                await progress_callback(level_done[0], effective_count)
+            await asyncio.sleep(0)  # stream cached progress like the UTXO trace
+
+        # Small chunks with several in flight → the progress bar advances
+        # continuously instead of jumping after each blocking batch call (the
+        # "fetch everything then just log" symptom). Behaves like the
+        # streaming UTXO trace. Only uncached txs reach the provider.
+        chunk_size = 4
+        chunks = [
+            uncached[i : i + chunk_size]
+            for i in range(0, len(uncached), chunk_size)
+        ]
+        if uncached and status_callback:
+            status_callback(
+                f"provider: {len(uncached)} tx"
+                + (f" (depth {current_depth})" if max_depth > 1 else "")
+            )
+
+        # Route by REAL batch capability — never by a blocking probe.
+        #
+        # Providers WITHOUT a true batch endpoint (blockfrost, maestro, kupmios)
+        # take the per-tx concurrent path: each tx is its own task and reports
+        # progress the instant it completes (FIRST_COMPLETED), so the bar streams
+        # smoothly exactly like the UTXO trace — no "fetch everything then log"
+        # stall, and no dead-air probe of the first chunk.
+        #
+        # Providers WITH a real batch endpoint (Koios /tx_info) fan all chunks
+        # out concurrently; a chunk that errors falls back to per-tx fetching.
+        if getattr(provider, "supports_batch_tx_fetch", False) and chunks:
+            results = await asyncio.gather(
+                *[_process_chunk(c) for c in chunks],
+                return_exceptions=True,
+            )
+            for c, r in zip(chunks, results):
+                if isinstance(r, Exception):
+                    if not isinstance(r, NotImplementedError):
+                        logger.debug("Chunk failed: %s — per-tx fallback", r)
+                    for h in c:
+                        await _examine_tx(h)
+        elif uncached:
+            await _run_concurrent_single()
 
     # ── Step 3: Build result ─────────────────────────────────────────────
 
@@ -331,7 +457,7 @@ async def trace_address_interactions(
 
     edges: list[AddressInteractionEdge] = []
     for (source, target), tx_list in edge_map.items():
-        direction = _compute_direction(source, target, target_address)
+        direction = _compute_direction(source, target, target_address, addr_depth)
         min_depth = min(d for _, d in tx_list)
         edges.append(
             AddressInteractionEdge(
@@ -342,6 +468,13 @@ async def trace_address_interactions(
                 direction_relative_to_target=direction,
                 source_depth=min_depth,
             )
+        )
+
+    if truncated:
+        errors.insert(
+            0,
+            f"Reached {_MAX_ADDRESSES}-address safety cap — graph truncated; "
+            f"narrow the trace (lower --max-depth or set --tx-limit)",
         )
 
     if not edges and total_tx_processed > 0 and errors:
@@ -424,8 +557,14 @@ def _record_tx_edges(
     queue: deque[tuple[str, int]],
     visited_addresses: set[str],
     max_depth: int,
+    count_ada: bool = True,
 ) -> None:
-    """Record directed edges + ADA flow for one tx, queuing new addresses."""
+    """Record directed edges + ADA flow for one tx, queuing new addresses.
+
+    ``count_ada`` is False when this tx's ADA was already accumulated on an
+    earlier BFS encounter — edges are still recorded (deduped downstream) but
+    net/gross/in/out ADA are not double-counted.
+    """
 
     # Directed edges: input → output, keep only pairs where current_addr is one side
     for in_addr in input_addrs:
@@ -435,26 +574,40 @@ def _record_tx_edges(
             if in_addr == current_addr or out_addr == current_addr:
                 all_edges.append((in_addr, out_addr, tx_hash, current_depth))
 
-                # Track counterparty for BFS expansion
+                # Track counterparty for BFS expansion. Skip the user's OWN
+                # change addresses (same wallet / stake key): they are not
+                # third-party counterparties, so traversing into them would
+                # inflate the graph with self-owned nodes.
                 other = out_addr if in_addr == current_addr else in_addr
-                if other not in visited_addresses and current_depth + 1 < max_depth:
+                if (
+                    other not in visited_addresses
+                    and current_depth + 1 < max_depth
+                    and not _same_wallet(other, current_addr)
+                ):
                     visited_addresses.add(other)
                     queue.append((other, current_depth + 1))
 
-    # Update per-address data
-    _update_addr_data(
-        input_addrs,
-        output_addrs,
-        tx_hash,
-        addr_tx_map,
-        addr_net_ada,
-        addr_gross_ada,
-        addr_incoming_ada,
-        addr_outgoing_ada,
-        addr_type,
-        addr_depth,
-        current_depth,
-    )
+    # Record tx membership for EVERY address in this tx on every encounter
+    # (set dedups by tx_hash). Independent of count_ada so tx_count is not
+    # under-counted when an address is first seen on a later BFS level.
+    for addr in set(input_addrs) | set(output_addrs):
+        addr_tx_map[addr].add(tx_hash)
+
+    # Update per-address ADA data (once per tx — see count_ada)
+    if count_ada:
+        _update_addr_data(
+            input_addrs,
+            output_addrs,
+            tx_hash,
+            addr_tx_map,
+            addr_net_ada,
+            addr_gross_ada,
+            addr_incoming_ada,
+            addr_outgoing_ada,
+            addr_type,
+            addr_depth,
+            current_depth,
+        )
 
 
 def _update_addr_data(
@@ -510,6 +663,7 @@ def _process_tx_data_static(
     max_depth: int,
     errors: list[str],
     discovered_utxos: dict[str, UTxONode],
+    count_ada: bool = True,
 ) -> None:
     """Process pre-fetched tx_data (batch path)."""
     _collect_utxos(tx_data, discovered_utxos)
@@ -534,17 +688,36 @@ def _process_tx_data_static(
         queue,
         visited_addresses,
         max_depth,
+        count_ada=count_ada,
     )
 
 
-def _compute_direction(source: str, target: str, target_address: str) -> str:
-    """Determine direction of interaction relative to target_address."""
+def _compute_direction(
+    source: str,
+    target: str,
+    target_address: str,
+    addr_depth: Optional[dict[str, int]] = None,
+) -> str:
+    """Determine direction of an edge relative to the traced target address.
+
+    Edges are recorded as ``source -> target`` = value flow (source spent,
+    target received). Direct edges touching the target are exact. For multi-hop
+    edges (neither endpoint is the target) the BFS depth tells which endpoint is
+    closer to the target: value moving toward the target = ``incoming``, away =
+    ``outgoing``. Equal-depth (lateral) edges remain ``unknown``.
+    """
     if source == target_address and target == target_address:
         return "both"
     if source == target_address:
         return "outgoing"
     if target == target_address:
         return "incoming"
+    if addr_depth:
+        ds = addr_depth.get(source)
+        dt = addr_depth.get(target)
+        if ds is not None and dt is not None and ds != dt:
+            # closer-to-target endpoint = smaller depth
+            return "outgoing" if ds < dt else "incoming"
     return "unknown"
 
 
@@ -555,3 +728,125 @@ def _format_errors(errors: list[str]) -> Optional[str]:
     if len(errors) > 5:
         text += f" (+{len(errors) - 5} more)"
     return text
+
+
+# ── CEX-related post-filter ───────────────────────────────────────────────
+
+
+def apply_cex_filter(result: AddressTraceResult) -> AddressTraceResult:
+    """Reduce an AddressTraceResult to only addresses on a path from
+    *target_address* to any CEX address in the registry.
+
+    "On a path to a CEX" means: an address X is kept if there exists at
+    least one CEX C in the trace graph such that the path from the target
+    to C passes through X. In other words, X is an ancestor of C in the
+    BFS tree rooted at the target.
+
+    Why this semantic
+    ----------------
+    In a typical BFS trace, the target is the central hub: every discovered
+    address shares a tx with the target (directly or via a short chain).
+    A naive "BFS-reachable from any CEX" filter would therefore keep the
+    ENTIRE graph as soon as a single CEX is found, which defeats the
+    purpose of filtering a large graph. The "ancestors of CEX up to
+    target" semantic keeps only the CEX-touching branches and drops
+    unrelated ones — which is what an investigator wants when scanning
+    a 500-node trace for CEX exposure.
+
+    Algorithm
+    ---------
+    1. Build undirected adjacency from ``result.edges``.
+    2. BFS from ``target_address`` and record each visited node's parent
+       in the BFS tree. Nodes unreachable from the target are dropped
+       (they shouldn't be in a valid trace, but be defensive).
+    3. For each CEX found in ``result.addresses`` (using ``is_cex`` and
+       a re-check via ``identify_cex()`` to honor registry updates after
+       the trace ran), walk back from the CEX to the target via parents,
+       marking every node on that path.
+    4. Kept set = union of all marked paths ∪ {target}.
+    5. Filter both ``result.addresses`` and ``result.edges`` to that set.
+
+    Edge cases
+    ----------
+    - **No CEX in result** → only the target is kept; the user sees an
+      empty CEX graph and a summary hint to increase ``--max-depth``.
+    - **Target itself is a registered CEX** → target is the CEX seed;
+      BFS parents include every address in the trace, so the entire
+      graph is kept (which is the correct behavior — if the target is a
+      CEX, every interactor is CEX-related).
+    - **Multiple CEXs** → union of their ancestor paths.
+    - **CEX not reachable from target in BFS tree** (e.g., a CEX that
+      is in the result but disconnected — shouldn't happen in a normal
+      BFS trace, but the filter handles it by skipping that CEX).
+
+    Returns
+    -------
+    A new ``AddressTraceResult`` with filtered ``addresses``/``edges``.
+    The ``total_transactions``, ``error``, ``max_depth``, and
+    ``provider_name`` fields are preserved (the trace itself is not
+    re-run).
+    """
+    target = result.target_address
+    if not result.addresses:
+        return result
+
+    # 1. Undirected adjacency
+    adj: dict[str, set[str]] = defaultdict(set)
+    for e in result.edges:
+        if e.source and e.target:
+            adj[e.source].add(e.target)
+            adj[e.target].add(e.source)
+
+    # 2. BFS from target, track parents (None = root)
+    parent: dict[str, Optional[str]] = {target: None}
+    bfs_queue: deque[str] = deque([target])
+    while bfs_queue:
+        cur = bfs_queue.popleft()
+        for nb in adj.get(cur, ()):
+            if nb not in parent:
+                parent[nb] = cur
+                bfs_queue.append(nb)
+
+    # 3. CEX seed set: prefer result.is_cex, but also re-check via
+    #    identify_cex() so registry updates after the trace are honored.
+    cex_in_result: set[str] = set()
+    for n in result.addresses:
+        if n.is_cex or identify_cex(n.address) is not None:
+            cex_in_result.add(n.address)
+
+    # 4. Build kept set: ancestors of each CEX up to target.
+    #    - If no CEX in result: keep only target (give a useful empty filter).
+    #    - If target itself is a CEX: keep the entire BFS tree (every
+    #      descendant of the target is CEX-related by definition).
+    #    - Otherwise: walk back from each non-target CEX to target via
+    #      BFS parents; union all such paths.
+    keep: set[str] = {target}
+    non_target_cex = cex_in_result - {target}
+    if non_target_cex:
+        for cex_addr in non_target_cex:
+            cur: Optional[str] = cex_addr
+            # Walk back via BFS parents. A CEX that is unreachable from
+            # target in the BFS tree (i.e., not in parent dict) is
+            # silently skipped — it shouldn't be in a valid trace.
+            while cur is not None and cur in parent:
+                keep.add(cur)
+                cur = parent[cur]
+    elif target in cex_in_result:
+        # Target is a registered CEX → every reachable node is CEX-related
+        keep = set(parent.keys())
+
+    # 5. Filter addresses
+    kept_addresses = [n for n in result.addresses if n.address in keep]
+
+    # 6. Filter edges (both endpoints must be in keep)
+    kept_edges = [e for e in result.edges if e.source in keep and e.target in keep]
+
+    return AddressTraceResult(
+        target_address=target,
+        addresses=kept_addresses,
+        edges=kept_edges,
+        total_transactions=result.total_transactions,
+        error=result.error,
+        provider_name=result.provider_name,
+        max_depth=result.max_depth,
+    )

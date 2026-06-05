@@ -206,6 +206,7 @@ class TestCrossModuleIntegration:
     async def test_forward_trace_rejects_invalid_provider(self, mock_provider):
         """Forward trace with non-kupmios/blockfrost/koios → error step."""
         mock_provider.provider_type = "maestro"  # not in allowed list
+        mock_provider.supports_forward = False  # maestro can't forward-trace
 
         steps = []
         async for step in trace_forward(mock_provider, START_REF, max_depth=1):

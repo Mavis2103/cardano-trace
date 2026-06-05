@@ -60,6 +60,15 @@ class RotatingKeyProvider(Provider):
         name, _ = self._instances[self._current]
         return f"{self._instances[self._current][1].provider_type}:{name}"
 
+    # Capabilities mirror the wrapped provider (all instances are the same type).
+    @property
+    def supports_forward(self) -> bool:
+        return getattr(self._instances[0][1], "supports_forward", False)
+
+    @property
+    def supports_batch_tx_fetch(self) -> bool:
+        return getattr(self._instances[0][1], "supports_batch_tx_fetch", False)
+
     # ── Rotate on 429 ────────────────────────────────────────────────
 
     async def _call(self, method: str, *args, **kwargs) -> Any:
@@ -115,6 +124,9 @@ class RotatingKeyProvider(Provider):
 
     async def get_spent_utxos(self, address: str) -> list[OutRef]:
         return await self._call("get_spent_utxos", address)
+
+    async def get_address_spend_map(self, address: str) -> dict[str, str]:
+        return await self._call("get_address_spend_map", address)
 
     async def get_address_transactions(self, address: str) -> list[str]:
         return await self._call("get_address_transactions", address)

@@ -89,6 +89,21 @@ class FallbackProvider(Provider):
         if self._names:
             self.current_provider = self._names[0]
 
+    @property
+    def supports_forward(self) -> bool:
+        """Forward works if ANY wrapped provider supports it."""
+        return any(
+            getattr(p, "supports_forward", False) for p in self._providers
+        )
+
+    @property
+    def supports_batch_tx_fetch(self) -> bool:
+        """Use the batch path only if EVERY provider has a real batch API;
+        otherwise the per-tx streaming path keeps progress smooth."""
+        return bool(self._providers) and all(
+            getattr(p, "supports_batch_tx_fetch", False) for p in self._providers
+        )
+
     async def __aenter__(self) -> "FallbackProvider":
         return self
 
@@ -243,6 +258,26 @@ class FallbackProvider(Provider):
             raise NotImplementedError("get_spent_utxos not supported by any provider")
         # Some providers tried (and returned empty) or errored — return empty
         return []
+
+    async def get_address_spend_map(self, address: str) -> dict[str, str]:
+        not_implemented_count = 0
+        for prov in self._providers:
+            try:
+                m = await asyncio.wait_for(
+                    self._retry(prov.get_address_spend_map, address), timeout=30.0
+                )
+                if m:
+                    return m
+            except NotImplementedError:
+                not_implemented_count += 1
+                continue
+            except Exception:
+                continue
+        if not_implemented_count == len(self._providers):
+            raise NotImplementedError(
+                "get_address_spend_map not supported by any provider"
+            )
+        return {}
 
     async def get_address_transactions(self, address: str) -> list[str]:
         not_implemented_count = 0

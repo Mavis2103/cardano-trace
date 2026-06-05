@@ -23,7 +23,7 @@ def _patch_all(save_funcs):
     patchers = [patch(p) for p in save_funcs]
     patchers.append(patch("utxo_tracer.cli.load_config", return_value={}))
     patchers.append(
-        patch("utxo_tracer.cache._store_to_models", return_value=({}, {}, {}))
+        patch("utxo_tracer.cache._store_to_models", return_value=({}, {}, {}, {}))
     )
     mocks = [p.start() for p in patchers]
     return patchers, mocks[:-2]
@@ -121,3 +121,50 @@ def test_no_cache_utxo_trace():
         mock_ft.assert_not_called()
     finally:
         _stop_all(started)
+
+
+def test_store_to_models_spent_map_is_address_keyed(tmp_path, monkeypatch):
+    """_store_to_models() 3rd return must be address-keyed spent map (forward).
+
+    Regression: it used to be node-keyed (out_nid -> [out_nids]) which never
+    matched trace_forward's address lookup, silently disabling the forward
+    cache. Now it must map address -> [spent_node_ids].
+    """
+    import utxo_tracer.cache as cache_mod
+    from utxo_tracer.models import Asset, OutRef, UTxONode
+
+    monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(cache_mod, "DB_PATH", tmp_path / "cache.db")
+    cache_mod.close_db()
+    try:
+        addr = "addr1_spender"
+        spent = UTxONode(
+            id="txin:0",
+            out_ref=OutRef("txin", 0),
+            address=addr,
+            assets=[Asset("", "", 5_000_000)],
+        )
+        produced = UTxONode(
+            id="txout:0",
+            out_ref=OutRef("txout", 0),
+            address="addr1_recipient",
+            assets=[Asset("", "", 5_000_000)],
+        )
+        cache_mod.save_utxos([spent, produced])
+        # tx consumes txin:0 and produces txout:0
+        cache_mod.save_transaction(
+            "txout",
+            {"inputs": [OutRef("txin", 0)], "outputs": [produced]},
+        )
+
+        nodes, inputs, spent_by_addr, spend_map = cache_mod._store_to_models(None)
+
+        # address-keyed, listing the spent input node
+        assert addr in spent_by_addr, "spent map must be keyed by address"
+        assert "txin:0" in spent_by_addr[addr]
+        # backward edges remain node-keyed: output -> its source input
+        assert inputs.get("txout:0") == ["txin:0"]
+        # precise forward spend map: consumed node_id -> spending tx_hash
+        assert spend_map.get("txin:0") == "txout"
+    finally:
+        cache_mod.close_db()

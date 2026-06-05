@@ -470,13 +470,17 @@ async def test_address_trace_pipeline(monkeypatch):
     assert len(result.edges) == 3, f"Expected 3 edges, got {len(result.edges)}"
 
     # ── Direction relative to target ──────────────────────────────────────
+    # Multi-hop edges are now classified by BFS depth: value moving away from
+    # the target (closer→farther) is "outgoing", toward it is "incoming".
+    # Here B(depth1)→D(depth2) flows downstream from A, so it is "outgoing".
     for e in result.edges:
         if e.source == A:
             assert e.direction_relative_to_target == "outgoing"
         elif e.target == A:
             assert e.direction_relative_to_target == "incoming"
         else:
-            assert e.direction_relative_to_target == "unknown"
+            # B→D: B is closer to the target than D → flow leaving the target
+            assert e.direction_relative_to_target == "outgoing"
 
     # ── Each AddressInteractionNode has correct type ────────────────────
     for node in result.addresses:

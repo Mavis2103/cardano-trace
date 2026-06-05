@@ -34,6 +34,96 @@ def _tx_data(tx_hash: str, inputs: list[UTxONode], outputs: list[UTxONode]) -> d
 
 
 @pytest.mark.asyncio
+async def test_tx_cache_get_serves_without_provider(monkeypatch):
+    """A tx present in the global cache is served WITHOUT a provider call.
+
+    Locks the req: smaller-depth / repeat traces replay from cache and only
+    missing txs hit the provider.
+    """
+    import utxo_tracer.tracing.address_interactions as ai_mod
+
+    monkeypatch.setattr(ai_mod, "save_transaction", lambda *a, **k: None)
+
+    addr_a = _TARGET_ADDR
+    addr_b = "addr1q" + "b" * 100
+    tx_cached = "aa" * 32
+    tx_live = "bb" * 32
+
+    a_in = _utxo(OutRef(tx_cached, 0), addr_a, ada=50.0)
+    b_out = _utxo(OutRef(tx_cached, 1), addr_b, ada=50.0)
+    cached_tx = _tx_data(tx_cached, inputs=[a_in], outputs=[b_out])
+
+    a_in2 = _utxo(OutRef(tx_live, 0), addr_a, ada=20.0)
+    b_out2 = _utxo(OutRef(tx_live, 1), addr_b, ada=20.0)
+    live_tx = _tx_data(tx_live, inputs=[a_in2], outputs=[b_out2])
+
+    provider = AsyncMock()
+    provider.current_provider = "blockfrost"
+
+    async def _addr_txs(addr):
+        return [tx_cached, tx_live]
+
+    async def _batch(hashes):
+        # Provider must ONLY ever be asked for the live tx, never the cached one
+        assert tx_cached not in hashes, "cached tx leaked to provider"
+        return [live_tx for _ in hashes]
+
+    provider.get_address_transactions.side_effect = _addr_txs
+    provider.get_transactions_utxos.side_effect = _batch
+
+    def _cache_get(h):
+        return cached_tx if h == tx_cached else None
+
+    result = await trace_address_interactions(
+        provider, addr_a, max_depth=1, tx_cache_get=_cache_get
+    )
+
+    # Both txs contributed: B incoming = 50 (cached) + 20 (live) = 70
+    b_node = next(n for n in result.addresses if n.address == addr_b)
+    assert b_node.total_incoming_ada == pytest.approx(70.0)
+
+
+@pytest.mark.asyncio
+async def test_ada_counted_once_across_depths(monkeypatch):
+    """A tx shared between the target and a counterparty must count ADA once.
+
+    Regression: net/gross/incoming/outgoing ADA accumulators were updated
+    every time a tx was processed. When a counterparty is expanded at a
+    deeper BFS level its shared tx was processed again → ADA doubled.
+    """
+    import utxo_tracer.tracing.address_interactions as ai_mod
+
+    monkeypatch.setattr(ai_mod, "save_transaction", lambda *a, **k: None)
+
+    addr_a = _TARGET_ADDR
+    addr_b = "addr1q" + "b" * 100
+    tx = "deadbeef" * 8
+
+    a_in = _utxo(OutRef(tx, 0), addr_a, ada=100.0)
+    b_out = _utxo(OutRef(tx, 1), addr_b, ada=100.0)
+    shared_tx = _tx_data(tx, inputs=[a_in], outputs=[b_out])
+
+    provider = AsyncMock()
+    provider.current_provider = "blockfrost"
+
+    async def _addr_txs(addr):
+        return [tx]  # both A and B "own" the same tx
+
+    async def _batch(hashes):
+        return [shared_tx for _ in hashes]
+
+    provider.get_address_transactions.side_effect = _addr_txs
+    provider.get_transactions_utxos.side_effect = _batch
+
+    result = await trace_address_interactions(provider, addr_a, max_depth=2)
+
+    b_node = next(n for n in result.addresses if n.address == addr_b)
+    assert b_node.total_incoming_ada == pytest.approx(100.0), (
+        f"shared tx ADA double-counted: B incoming={b_node.total_incoming_ada}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_batch_empty_result_error_tracking(mock_provider):
     """Batch path: empty tx data from get_transactions_utxos appends to errors.
 
@@ -705,3 +795,38 @@ async def test_skip_tx_hashes_target_only_fallback(temp_cache):
     )
     assert mock2.get_transaction_utxos.call_count == 0
     assert result2.total_transactions == 0
+
+
+# ── direction-at-depth + same-wallet (change address) ──────────────────────
+
+
+def test_compute_direction_direct_edges():
+    from utxo_tracer.tracing.address_interactions import _compute_direction
+
+    t = "target"
+    assert _compute_direction(t, "x", t) == "outgoing"
+    assert _compute_direction("x", t, t) == "incoming"
+    assert _compute_direction(t, t, t) == "both"
+
+
+def test_compute_direction_multihop_uses_depth():
+    from utxo_tracer.tracing.address_interactions import _compute_direction
+
+    t = "target"
+    depth = {t: 0, "near": 1, "far": 2}
+    # value flowing from the closer node outward = leaving the target = outgoing
+    assert _compute_direction("near", "far", t, depth) == "outgoing"
+    # value flowing inward toward the target = incoming
+    assert _compute_direction("far", "near", t, depth) == "incoming"
+    # equal depth (lateral) stays unknown
+    assert _compute_direction("a", "b", t, {"a": 1, "b": 1}) == "unknown"
+    # missing depth info falls back to unknown
+    assert _compute_direction("a", "b", t, None) == "unknown"
+
+
+def test_same_wallet_non_bech32_is_false():
+    from utxo_tracer.tracing.address_interactions import _same_wallet
+
+    # non-decodable / no stake key → never grouped (except identity)
+    assert _same_wallet("addr1_fake", "addr1_other") is False
+    assert _same_wallet("same", "same") is True

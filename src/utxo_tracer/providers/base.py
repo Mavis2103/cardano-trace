@@ -13,6 +13,18 @@ class Provider(ABC):
 
     provider_type: str = "base"
 
+    # True only for providers with a REAL multi-tx batch endpoint (e.g. Koios
+    # /tx_info). When False, ``get_transactions_utxos`` is just a serial loop, so
+    # address tracing must use its per-tx concurrent path to stream progress
+    # smoothly instead of stalling on blocking 4-tx "batches".
+    supports_batch_tx_fetch: bool = False
+
+    # True for providers that implement ``get_address_spend_map`` (forward
+    # tracing). The forward tracer gates on this capability, NOT on
+    # ``provider_type`` — so wrapper providers (rotating/fallback) report the
+    # capability of what they wrap instead of being wrongly excluded.
+    supports_forward: bool = False
+
     @abstractmethod
     async def health_check(self) -> bool:
         """Return True if provider is reachable and authorized."""
@@ -26,6 +38,21 @@ class Provider(ABC):
         """Return {'inputs': list[OutRef], 'outputs': list[UTxONode]}."""
 
     async def get_spent_utxos(self, address: str) -> list["OutRef"]:
+        raise NotImplementedError(
+            f"{self.provider_type} does not support forward tracing"
+        )
+
+    async def get_address_spend_map(self, address: str) -> dict[str, str]:
+        """Return a UTXO-precise spend map for forward tracing.
+
+        Maps every *consumed* input ``node_id`` (``tx_hash:index``) seen at this
+        address to the ``tx_hash`` of the transaction that spent it. A UTXO that
+        is absent from the map is unspent (a terminal node for forward tracing).
+
+        This replaces the ambiguous ``get_spent_utxos`` semantics: forward
+        tracing must follow the single transaction that consumed a specific
+        UTXO, not every transaction that ever touched the address.
+        """
         raise NotImplementedError(
             f"{self.provider_type} does not support forward tracing"
         )

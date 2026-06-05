@@ -103,6 +103,58 @@ def classify_address(address: str) -> AddressType:
     return AddressType.SCRIPT if (idx & 2) else AddressType.WALLET
 
 
+def _bech32_to_bytes(address: str) -> bytes | None:
+    """Decode a Cardano Shelley Bech32 address to its raw payload bytes.
+
+    Returns ``None`` for non-Bech32 (Byron/stake/unknown) or malformed input.
+    No checksum verification (we only need the payload, and inputs come from a
+    provider that already validated them).
+    """
+    pos = address.rfind("1")
+    if pos < 1:
+        return None
+    data_part = address[pos + 1 :]
+    values: list[int] = []
+    for ch in data_part:
+        i = _BECH32.find(ch)
+        if i == -1:
+            return None
+        values.append(i)
+    if len(values) < 6:
+        return None
+    values = values[:-6]  # strip 6-char checksum
+    # convert from 5-bit groups to 8-bit bytes
+    acc = 0
+    bits = 0
+    out = bytearray()
+    for v in values:
+        acc = (acc << 5) | v
+        bits += 5
+        while bits >= 8:
+            bits -= 8
+            out.append((acc >> bits) & 0xFF)
+    return bytes(out)
+
+
+def address_stake_key(address: str) -> str | None:
+    """Return the hex stake credential of a Cardano base address, else ``None``.
+
+    Two addresses sharing a non-None stake key belong to the same wallet — the
+    standard heuristic used to recognise a user's own change addresses so they
+    are not mistaken for third-party counterparties.
+
+    Only base addresses (payment + stake, 57-byte payload) have a stake part.
+    Enterprise/pointer/script-only addresses return ``None``.
+    """
+    if not address.startswith(("addr1", "addr_test1")):
+        return None
+    payload = _bech32_to_bytes(address)
+    if payload is None or len(payload) < 57:
+        return None
+    # header(1) + payment credential(28) + stake credential(28)
+    return payload[29:57].hex()
+
+
 def hex_to_utf8(hex_str: str) -> str:
     """Convert hex string to UTF-8, fallback to original on failure."""
     if not hex_str:

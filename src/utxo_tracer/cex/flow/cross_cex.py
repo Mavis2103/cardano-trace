@@ -58,16 +58,20 @@ def detect_cross_cex_flows(
     cex_deposit_addrs: dict[str, str] = {}
     cex_withdrawal_hashes: dict[str, str] = {}  # address → tx_hash
     cex_deposit_hashes: dict[str, str] = {}
+    cex_withdrawal_times: dict[str, int] = {}  # address → CEX timestamp
+    cex_deposit_times: dict[str, int] = {}
 
     for m in cashflow_summary.matches:
         if m.cex_record.is_withdrawal:
             for oc in m.onchain_records:
                 cex_withdrawal_addrs[oc.address] = m.cex_record.exchange
                 cex_withdrawal_hashes[oc.address] = oc.tx_hash
+                cex_withdrawal_times[oc.address] = m.cex_record.timestamp
         elif m.cex_record.is_deposit:
             for oc in m.onchain_records:
                 cex_deposit_addrs[oc.address] = m.cex_record.exchange
                 cex_deposit_hashes[oc.address] = oc.tx_hash
+                cex_deposit_times[oc.address] = m.cex_record.timestamp
 
     # Collect all addresses from cashflow
     all_cex_source_addrs = set(cex_withdrawal_addrs.keys())
@@ -85,7 +89,7 @@ def detect_cross_cex_flows(
     # If we have both directions, pair them
     if backward_trace and forward_trace:
         # Find CEX addresses in backward trace (cash-in sources)
-        found_sources: list[tuple[str, str, float, str]] = []  # (cex, tx_hash, amount, addr)
+        found_sources: list[tuple[str, str, float, str, int]] = []  # (cex, tx_hash, amount, addr, timestamp)
         for node in backward_trace.nodes:
             addr = node.address
             if addr in cex_withdrawal_addrs:
@@ -94,10 +98,11 @@ def detect_cross_cex_flows(
                     cex_withdrawal_hashes.get(addr, ""),
                     node.ada,
                     addr,
+                    cex_withdrawal_times.get(addr, 0),
                 ))
 
         # Find CEX addresses in forward trace (cash-out destinations)
-        found_dests: list[tuple[str, str, float, str]] = []
+        found_dests: list[tuple[str, str, float, str, int]] = []
         for node in forward_trace.nodes:
             addr = node.address
             if addr in cex_deposit_addrs:
@@ -106,12 +111,14 @@ def detect_cross_cex_flows(
                     cex_deposit_hashes.get(addr, ""),
                     node.ada,
                     addr,
+                    cex_deposit_times.get(addr, 0),
                 ))
 
         # Pair sources and dests when they connect through the hacker
-        for src_cex, src_tx, src_amt, src_addr in found_sources:
-            for dst_cex, dst_tx, dst_amt, dst_addr in found_dests:
+        for src_cex, src_tx, src_amt, src_addr, src_ts in found_sources:
+            for dst_cex, dst_tx, dst_amt, dst_addr, dst_ts in found_dests:
                 if abs(src_amt - dst_amt) / max(src_amt, 0.001) < 0.5:
+                    time_delta = abs(dst_ts - src_ts) if src_ts and dst_ts else 0
                     flows.append(CrossCexFlow(
                         inflow_cex=src_cex,
                         inflow_amount=src_amt,
@@ -122,7 +129,7 @@ def detect_cross_cex_flows(
                         outflow_tx_hash=dst_tx,
                         outflow_confidence=0.85,
                         hacker_address=hacker_addr if hacker_addr else src_addr,
-                        time_delta_seconds=0,  # would need timestamps
+                        time_delta_seconds=time_delta,
                         intermediate_addresses=[],
                     ))
 

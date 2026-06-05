@@ -1,4 +1,4 @@
-"""Graph visualization — Dash Cytoscape (default)."""
-from .dash_app import create_app, start_server
+"""Graph visualization — AntV G6 (v5) renderer."""
+from .g6_viz import start_address_server, start_server
 
-__all__ = ["create_app", "start_server"]
+__all__ = ["start_server", "start_address_server"]

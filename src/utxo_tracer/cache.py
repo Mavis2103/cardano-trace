@@ -201,15 +201,22 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _cache_key(start_out_ref: OutRef, direction: str, max_depth: int) -> str:
-    key_str = (
-        f"{start_out_ref.tx_hash}#{start_out_ref.output_index}/{direction}/{max_depth}"
-    )
+def _cache_key(start_out_ref: OutRef, direction: str, max_depth: int = 0) -> str:
+    """Depth-INDEPENDENT cache key for a (start, direction) trace.
+
+    ``max_depth`` is intentionally NOT part of the key: a single snapshot/
+    manifest per (start, direction) is kept and grown in place as depth
+    increases. This is what makes depth-reuse work and removes the old
+    one-row-per-depth accumulation ("cache leak"). The parameter is retained
+    for call-site compatibility but ignored.
+    """
+    key_str = f"{start_out_ref.tx_hash}#{start_out_ref.output_index}/{direction}"
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
 def _addr_cache_key(address: str, max_depth: int = 1) -> str:
-    key_str = f"addr:{address}:d{max_depth}"
+    """Depth-INDEPENDENT address-trace key (see ``_cache_key``)."""
+    key_str = f"addr:{address}"
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
@@ -478,17 +485,28 @@ def _store_to_models(
     _unused_store: Optional[dict] = None,
     limit: Optional[int] = None,
     offset: int = 0,
-) -> tuple[dict[str, UTxONode], dict[str, list[str]], dict[str, list[str]]]:
+) -> tuple[
+    dict[str, UTxONode],
+    dict[str, list[str]],
+    dict[str, list[str]],
+    dict[str, str],
+]:
     """Load cached UTXOs + edges into dicts for tracing engines.
 
     Paginates the UTXO table via ``limit``/``offset`` so callers can
     process large caches incrementally.  By default (``limit=None``)
     loads ALL rows — same behaviour as before.
 
-    Returns (nodes, inputs, outputs) where:
+    Returns (nodes, inputs, spent_by_addr, spend_map) where:
       - nodes: dict[node_id → UTxONode]
       - inputs: dict[node_id → [source_node_id, ...]]  (backward edges)
-      - outputs: dict[node_id → [target_node_id, ...]]  (forward edges)
+      - spent_by_addr: dict[address → [spent_node_id, ...]]  (forward, legacy)
+      - spend_map: dict[consumed_node_id → spending_tx_hash]  (forward, precise)
+
+    ``spend_map`` is what the UTXO-precise ``trace_forward`` consumes: for any
+    UTXO it tells which transaction spent it, so forward reuse from cache walks
+    the exact spending tx without a provider call. ``spent_by_addr`` is retained
+    (address-keyed) for backward compatibility / diagnostics.
     """
     conn = _get_db()
     query = "SELECT * FROM utxos ORDER BY node_id"
@@ -504,7 +522,11 @@ def _store_to_models(
             nodes[node.id] = node
 
     inputs: dict[str, list[str]] = {}
-    outputs: dict[str, list[str]] = {}
+    spent_by_addr: dict[str, list[str]] = {}
+    spend_map: dict[str, str] = {}
+    # de-dup helpers (membership tests on sets, not O(n) list scans)
+    _inputs_seen: dict[str, set[str]] = {}
+    _spent_seen: dict[str, set[str]] = {}
     tx_query = "SELECT tx_hash, inputs, outputs FROM transactions"
     tx_params: list = []
     if limit is not None:
@@ -512,27 +534,39 @@ def _store_to_models(
         tx_params.extend([limit, offset])
     tx_rows = conn.execute(tx_query, tx_params).fetchall()
     for tx_row in tx_rows:
+        tx_hash = tx_row["tx_hash"]
         tx_inputs = json.loads(tx_row["inputs"]) if tx_row["inputs"] else []
         tx_outputs = json.loads(tx_row["outputs"]) if tx_row["outputs"] else []
+        # backward edges: each output points back to the tx's input nodes
         for out_nid in tx_outputs:
+            seen = _inputs_seen.setdefault(out_nid, set())
+            bucket = inputs.setdefault(out_nid, [])
             for in_nid in tx_inputs:
-                inputs.setdefault(out_nid, [])
-                if in_nid not in inputs[out_nid]:
-                    inputs[out_nid].append(in_nid)
+                if in_nid not in seen:
+                    seen.add(in_nid)
+                    bucket.append(in_nid)
+        # forward: each input node was consumed by THIS tx.
+        #   spend_map: precise node_id -> spending tx_hash (used by trace_forward)
+        #   spent_by_addr: legacy address -> [spent node ids]
         for in_nid in tx_inputs:
-            for out_nid in tx_outputs:
-                outputs.setdefault(in_nid, [])
-                if out_nid not in outputs[in_nid]:
-                    outputs[in_nid].append(out_nid)
+            if tx_hash:
+                spend_map.setdefault(in_nid, tx_hash)
+            node = nodes.get(in_nid)
+            if node is None or not node.address:
+                continue
+            seen = _spent_seen.setdefault(node.address, set())
+            if in_nid not in seen:
+                seen.add(in_nid)
+                spent_by_addr.setdefault(node.address, []).append(in_nid)
 
-    return nodes, inputs, outputs
+    return nodes, inputs, spent_by_addr, spend_map
 
 
 def load_all_stored(
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> tuple[dict[str, UTxONode], dict[str, list[str]]]:
-    nodes, inputs, _outputs = _store_to_models(limit=limit, offset=offset)
+    nodes, inputs, _outputs, _spend = _store_to_models(limit=limit, offset=offset)
     return nodes, inputs
 
 
@@ -709,8 +743,28 @@ def save_trace(
     max_depth: int,
     provider: str = "",
 ) -> str:
-    """Save a v2 trace snapshot to SQLite."""
+    """Save a v2 trace snapshot to SQLite.
+
+    Keeps the DEEPEST snapshot per (start, direction): a later shallower trace
+    will not clobber a previously stored deeper one (the global store still
+    holds every node either way).
+    """
     key = _cache_key(start_out_ref, direction, max_depth)
+
+    conn = _get_db()
+    existing = conn.execute(
+        "SELECT metadata FROM trace_snapshots WHERE trace_key = ? AND trace_type = 'utxo'",
+        (key,),
+    ).fetchone()
+    if existing is not None:
+        try:
+            prev_depth = json.loads(existing["metadata"]).get("max_depth", 0)
+        except Exception:
+            prev_depth = 0
+        if prev_depth > max_depth:
+            # A deeper snapshot already exists — only refresh cross-store nodes.
+            save_utxos(result.nodes)
+            return key
 
     metadata = {
         "key": key,
@@ -758,7 +812,17 @@ def save_trace(
 def load_trace(
     start_out_ref: OutRef, direction: str, max_depth: int
 ) -> Optional[TraceResult]:
-    """Load a complete trace snapshot from SQLite (fallback to store reconstruction)."""
+    """Load a trace at the requested depth from cache.
+
+    Prefers a depth-capped reconstruction from the global store (utxos +
+    transactions), which is depth-ACCURATE — a depth-5 request after a depth-10
+    trace returns exactly the depth-5 view with zero provider calls. Falls back
+    to the stored snapshot only when the store cannot rebuild the graph.
+    """
+    rebuilt = _build_from_store(start_out_ref, direction, max_depth)
+    if rebuilt is not None and rebuilt.nodes:
+        return rebuilt
+
     key = _cache_key(start_out_ref, direction, max_depth)
 
     conn = _get_db()
@@ -807,8 +871,8 @@ def load_trace(
                 provider_name=metadata.get("provider", ""),
             )
 
-    # Store reconstruction from SQLite
-    return _build_from_store(start_out_ref, direction, max_depth)
+    # Store reconstruction was already attempted first; nothing else to serve.
+    return None
 
 
 def _build_from_store(
@@ -881,13 +945,17 @@ def _build_from_store(
                         eid = f"{in_nid}->{out_nid}"
                         if eid not in seen_edges:
                             seen_edges.add(eid)
+                            # Edge in_nid→out_nid is value flowing forward
+                            # (a tx input becoming an output). Label by the
+                            # trace direction so the dash colouring (input=red,
+                            # output=green) matches what the user asked for.
                             edges.append(
                                 TransactionEdge(
                                     id=eid,
                                     source=in_nid,
                                     target=out_nid,
                                     direction="input"
-                                    if in_nid in visited and out_nid in visited
+                                    if direction == "backward"
                                     else "output",
                                     tx_hash=tx_hash,
                                 )

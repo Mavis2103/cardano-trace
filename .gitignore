@@ -4,3 +4,7 @@ dist
 .env
 .sisyphus
 .omc
+graphify-out
+.claude
+.omo
+.utxo-cache/
