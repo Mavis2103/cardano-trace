@@ -59,6 +59,7 @@ def _same_wallet(a: str, b: str) -> bool:
     sa, sb = _stake_cache[a], _stake_cache[b]
     return sa is not None and sa == sb
 
+
 _TIMEOUT_PER_FETCH = 15.0
 _BATCH_SIZE = 20
 _MAX_TX_LIMIT = 100_000
@@ -233,7 +234,7 @@ async def trace_address_interactions(
             break
 
         # ── Step 2: Fetch tx details — try batch, fall back to concurrent ─
-        sem = asyncio.Semaphore(10)
+        sem = asyncio.Semaphore(25)
         level_done = [0]  # txs completed at THIS address level (monotonic)
 
         def _take_ada(tx_hash: str) -> bool:
@@ -407,14 +408,11 @@ async def trace_address_interactions(
                 await progress_callback(level_done[0], effective_count)
             await asyncio.sleep(0)  # stream cached progress like the UTXO trace
 
-        # Small chunks with several in flight → the progress bar advances
-        # continuously instead of jumping after each blocking batch call (the
-        # "fetch everything then just log" symptom). Behaves like the
-        # streaming UTXO trace. Only uncached txs reach the provider.
-        chunk_size = 4
+        # Chunks balance progress-bar smoothness vs batch efficiency.
+        # Koios handles 100 txs/call; 25 keeps updates frequent enough.
+        chunk_size = 25
         chunks = [
-            uncached[i : i + chunk_size]
-            for i in range(0, len(uncached), chunk_size)
+            uncached[i : i + chunk_size] for i in range(0, len(uncached), chunk_size)
         ]
         if uncached and status_callback:
             status_callback(

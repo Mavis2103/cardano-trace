@@ -22,6 +22,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
+import subprocess
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -371,9 +373,7 @@ def _render_html(payload: dict) -> str:
         f"<script src='{_G6_CDN}'></script>"
         "<style>" + _CSS + "</style></head><body>"
     )
-    boot = (
-        "<script>window.__PAYLOAD__=" + data_json + ";</script>"
-    )
+    boot = "<script>window.__PAYLOAD__=" + data_json + ";</script>"
     return head + _BODY + boot + "<script>" + _JS + "</script></body></html>"
 
 
@@ -822,6 +822,40 @@ _JS = r"""
 
 
 # ---------------------------------------------------------------------------
+# browser launch (Wayland/Vulkan-safe)
+# ---------------------------------------------------------------------------
+
+
+def _open_browser(url: str) -> None:
+    import platform
+
+    if platform.system() != "Linux":
+        webbrowser.open(url)
+        return
+
+    for browser in ("chromium", "chromium-browser", "google-chrome"):
+        path = shutil.which(browser)
+        if path:
+            try:
+                subprocess.Popen(
+                    [
+                        path,
+                        "--ozone-platform-hint=auto",
+                        "--disable-vulkan",
+                        "--no-sandbox",
+                        url,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except Exception:
+                continue
+
+    webbrowser.open(url)
+
+
+# ---------------------------------------------------------------------------
 # server
 # ---------------------------------------------------------------------------
 
@@ -881,9 +915,7 @@ def _serve(html: str, port: int, cache_key: str) -> None:
     url = f"http://127.0.0.1:{port}/"
     print(f"\n  G6 graph → {url}")
     print("  Press Ctrl+C to stop\n")
-    threading.Thread(
-        target=lambda: webbrowser.open(url), daemon=True
-    ).start()
+    threading.Thread(target=lambda: _open_browser(url), daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

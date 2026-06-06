@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 RETRY_DELAYS = [0.5, 1.0, 2.0]  # seconds
 MAX_RETRIES = len(RETRY_DELAYS)
 
+# ── Circuit breaker config ────────────────────────────────────────────
+CIRCUIT_BREAKER_THRESHOLD = 3  # skip provider after N consecutive failures
+
 # ── transient-error predicates ────────────────────────────────────────
 _TRANSIENT_HTTPX = (
     httpx.TimeoutException,
@@ -86,15 +89,14 @@ class FallbackProvider(Provider):
         self._providers = [p for _, p in providers]
         self._names = [n for n, _ in providers]
         self._any_raised_capability = False
+        self._failure_counts: dict[str, int] = {n: 0 for n in self._names}
         if self._names:
             self.current_provider = self._names[0]
 
     @property
     def supports_forward(self) -> bool:
         """Forward works if ANY wrapped provider supports it."""
-        return any(
-            getattr(p, "supports_forward", False) for p in self._providers
-        )
+        return any(getattr(p, "supports_forward", False) for p in self._providers)
 
     @property
     def supports_batch_tx_fetch(self) -> bool:
@@ -184,8 +186,13 @@ class FallbackProvider(Provider):
     async def get_utxo_by_out_ref(self, out_ref: OutRef) -> Optional[UTxONode]:
         errors: list[str] = []
         for name, prov in zip(self._names, self._providers):
+            if self._failure_counts.get(name, 0) >= CIRCUIT_BREAKER_THRESHOLD:
+                errors.append(f"{name}: circuit-broken")
+                continue
+
             node = await self._try_get_utxo(prov, out_ref)
             if node is not None:
+                self._failure_counts[name] = 0
                 self.current_provider = name
                 if name != self._names[0]:
                     _warn(
@@ -193,6 +200,12 @@ class FallbackProvider(Provider):
                         f"using {name}[/yellow]"
                     )
                 return node
+            self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
+            if self._failure_counts[name] == CIRCUIT_BREAKER_THRESHOLD:
+                _warn(
+                    f"[yellow]Circuit breaker: skipping {name} after "
+                    f"{CIRCUIT_BREAKER_THRESHOLD} consecutive failures[/yellow]"
+                )
             errors.append(f"{name}: failed")
         self.current_provider = self._names[-1]
         logger.warning("All providers failed for %s — %s", out_ref, "; ".join(errors))
@@ -204,10 +217,12 @@ class FallbackProvider(Provider):
     async def get_transaction_utxos(self, tx_hash: str) -> dict:
         self._any_raised_capability = False
         for name, prov in zip(self._names, self._providers):
+            if self._failure_counts.get(name, 0) >= CIRCUIT_BREAKER_THRESHOLD:
+                continue
+
             try:
                 data = await self._try_get_tx(prov, tx_hash)
             except CapabilityError:
-                # Provider is reachable but lacks DumpHistory — try next
                 logger.info(
                     "Provider %s lacks backward capability for tx %s: %s",
                     name,
@@ -215,21 +230,24 @@ class FallbackProvider(Provider):
                     "DumpHistory unavailable",
                 )
                 continue
-            if data is not None:
-                # Only accept when the provider actually returned data;
-                # empty both-lists means "no data for this tx" — try next.
-                if data.get("outputs") or data.get("inputs"):
-                    self.current_provider = name
-                    if name != self._names[0]:
-                        _warn(
-                            f"[yellow]↑ Fallback tx {tx_hash[:16]}…: "
-                            f"{self._names[0]} failed, using {name}[/yellow]"
-                        )
-                    return data
-                continue
 
-        # If ALL providers lack capability (e.g. no DumpHistory),
-        # log a clear message instead of silent failure
+            if data is not None and (data.get("outputs") or data.get("inputs")):
+                self._failure_counts[name] = 0
+                self.current_provider = name
+                if name != self._names[0]:
+                    _warn(
+                        f"[yellow]↑ Fallback tx {tx_hash[:16]}…: "
+                        f"{self._names[0]} failed, using {name}[/yellow]"
+                    )
+                return data
+
+            self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
+            if self._failure_counts[name] == CIRCUIT_BREAKER_THRESHOLD:
+                _warn(
+                    f"[yellow]Circuit breaker: skipping {name} after "
+                    f"{CIRCUIT_BREAKER_THRESHOLD} consecutive failures[/yellow]"
+                )
+
         if self._any_raised_capability:
             _warn(
                 "[yellow]All providers lack backward capability "

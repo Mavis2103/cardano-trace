@@ -91,7 +91,6 @@ class UTxORPCProvider(Provider):
         return 0
 
     async def _get_query_client(self):
-        """Get or create a connected CardanoQueryClient."""
         if self._query_client is not None:
             return self._query_client
 
@@ -110,17 +109,22 @@ class UTxORPCProvider(Provider):
                     f"SDK not available: {e}",
                 )
 
-            self._query_client = CardanoQueryClient(
+            client = CardanoQueryClient(
                 uri=self._uri,
                 metadata=self._metadata(),
                 secure=self._secure,
             )
-            self._qc_cm = self._query_client.async_connect()
-            await self._qc_cm.__aenter__()
+            cm = client.async_connect()
+            try:
+                await cm.__aenter__()
+            except Exception:
+                await cm.__aexit__(None, None, None)
+                raise
+            self._query_client = client
+            self._qc_cm = cm
             return self._query_client
 
     async def _get_sync_client(self):
-        """Get or create a connected CardanoSyncClient."""
         if self._sync_client is not None:
             return self._sync_client
 
@@ -139,13 +143,19 @@ class UTxORPCProvider(Provider):
                     f"SDK not available: {e}",
                 )
 
-            self._sync_client = CardanoSyncClient(
+            client = CardanoSyncClient(
                 uri=self._uri,
                 metadata=self._metadata(),
                 secure=self._secure,
             )
-            self._sc_cm = self._sync_client.async_connect()
-            await self._sc_cm.__aenter__()
+            cm = client.async_connect()
+            try:
+                await cm.__aenter__()
+            except Exception:
+                await cm.__aexit__(None, None, None)
+                raise
+            self._sync_client = client
+            self._sc_cm = cm
             return self._sync_client
 
     async def aclose(self) -> None:
@@ -224,8 +234,7 @@ class UTxORPCProvider(Provider):
 
         tx_hash_bytes = bytes.fromhex(tx_hash)
         keys = [
-            TxoRef(hash=tx_hash_bytes, index=idx)
-            for idx in range(MAX_OUTPUT_PROBE)
+            TxoRef(hash=tx_hash_bytes, index=idx) for idx in range(MAX_OUTPUT_PROBE)
         ]
 
         try:
@@ -350,9 +359,7 @@ class UTxORPCProvider(Provider):
         try:
             from utxorpc_spec.utxorpc.v1alpha.query import query_pb2 as q_pb2
         except ImportError as e:
-            raise NotImplementedError(
-                f"UTxORPC SDK import failed: {e}"
-            ) from e
+            raise NotImplementedError(f"UTxORPC SDK import failed: {e}") from e
 
         qc = await self._get_query_client()
 
