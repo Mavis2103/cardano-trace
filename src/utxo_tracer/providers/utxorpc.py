@@ -356,37 +356,9 @@ class UTxORPCProvider(Provider):
     # ── Forward tracing ───────────────────────────────────────────────
 
     async def get_spent_utxos(self, address: str) -> list:
-        try:
-            from utxorpc_spec.utxorpc.v1alpha.query import query_pb2 as q_pb2
-        except ImportError as e:
-            raise NotImplementedError(f"UTxORPC SDK import failed: {e}") from e
-
-        qc = await self._get_query_client()
-
-        try:
-            addr_bytes = bytes.fromhex(address)
-        except ValueError:
-            addr_bytes = address.encode("utf-8")
-
-        predicate = q_pb2.UtxoPredicate()
-        pattern = predicate.match.cardano
-        pattern.address.exact_address = addr_bytes
-
-        try:
-            async for resp in qc.async_search_utxos(predicate=predicate):
-                refs = []
-                for item in resp.items:
-                    if item.txo_ref:
-                        refs.append(
-                            OutRef(
-                                tx_hash=item.txo_ref.hash.hex(),
-                                output_index=item.txo_ref.index,
-                            )
-                        )
-                return refs
-        except Exception as e:
-            logger.debug("get_spent_utxos failed: %s", e)
-            return []
+        raise NotImplementedError(
+            f"{self.provider_type} does not support forward tracing"
+        )
 
     async def get_address_transactions(self, address: str) -> list[str]:
         """Return all transaction hashes involving this address via UTxORPC.
