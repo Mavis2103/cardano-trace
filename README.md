@@ -20,18 +20,21 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 | **Input UTXO pre-caching** | When a provider returns full UTXO data alongside input refs, cache it immediately to avoid separate API calls later. |
 
 ### Providers
-| Provider | Type | Backward | Forward | Auth |
-|----------|------|----------|---------|------|
-| **Blockfrost** | REST API | ✓ | ✗ | `project_id` / `bearer` / `dmtr-api-key` |
-| **Koios** | REST API | ✓ | ✗ | Bearer token (optional) |
-| **Maestro** | REST API | ✓ | ✗ | `x-api-key` |
-| **UTxORPC** | gRPC SDK | ✓ | ✓ | `x-api-key` / `dmtr-api-key` |
-| **Kupmios** | Kupo + Ogmios | ✓ | ✓ | Optional per-service |
+| Provider | Type | Backward | Forward | Address | Auth |
+|----------|------|----------|---------|---------|------|
+| **Blockfrost** | REST API | ✓ | ✓ | ✓ | `project_id` / `bearer` / `dmtr-api-key` |
+| **Koios** | REST API | ✓ | ✓ | ✓ | Bearer token (optional) |
+| **Maestro** | REST API | ✓ | ✗ | ✓ | `api-key` |
+| **Kupmios** | Kupo + Ogmios | ✓ | ✓ | ✓ | Optional per-service (`dmtr-api-key` / Bearer) |
+| **UTxORPC** | gRPC SDK | ✓ | ✗ | ✗ | `x-api-key` / `dmtr-api-key` |
+| **minibf** (Dolos) | REST API | ✓ | ✓ | ✓ | usually none (`project_id` optional) |
+
+Forward tracing is gated on the provider's real capability (`supports_forward`), so blockfrost / koios / kupmios / minibf can trace forward; maestro and utxorpc are backward-only.
 
 ### Fallback & Resilience
 | Feature | Description |
 |---------|-------------|
-| **Auto-fallback** | Primary → utxorpc → blockfrost → koios → maestro on failure |
+| **Auto-fallback** | Primary → blockfrost → koios → maestro → utxorpc on failure (kupmios/minibf excluded — they need explicit local URLs) |
 | **Transient retry** | Exponential backoff (0.5s, 1s, 2s) for timeouts, connection errors, gRPC UNAVAILABLE |
 | **Capability-aware** | Skips providers that can't do backward tracing (e.g. DumpHistory unavailable) |
 | **Non-transient propagation** | ValueError, TypeError, KeyError, rate-limit (429) propagate immediately |
@@ -39,7 +42,8 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 ### CLI Commands
 | Command | Description |
 |---------|-------------|
-| `utxo-tracer trace` | Full trace engine with all options |
+| `utxo-tracer trace-utxo` | Full single-UTXO trace engine with all options |
+| `utxo-tracer trace-address` | Trace all addresses that interact with a given address |
 | `utxo-tracer health` | Check provider connectivity (single or fallback chain) |
 | `utxo-tracer assets` | Show asset breakdown for a single UTXO (ADA, native assets, datum, script ref) |
 | `utxo-tracer config set` | Save provider credentials persistently to `~/.utxo-tracer/config.json` |
@@ -76,7 +80,7 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 ### Trace Address CLI Options
 
 The `trace-address` subcommand traces ALL addresses that share a transaction
-with a given Cardano address (vs. `trace` which follows a single UTXO).
+with a given Cardano address (vs. `trace-utxo` which follows a single UTXO).
 Useful for "who does this address interact with" investigations.
 
 | Option | Values | Default |
@@ -246,22 +250,22 @@ A `.env` file is auto-discovered from the current working directory, parent dire
 
 ```bash
 # Basic backward trace (default direction, depth 5, auto-fallback)
-utxo-tracer trace abc123def456...#0
+utxo-tracer trace-utxo abc123def456...#0
 
 # Specify provider and increase depth
-utxo-tracer trace abc123def456...#0 \
+utxo-tracer trace-utxo abc123def456...#0 \
     --provider blockfrost \
     --api-key mainnet_XXX \
     --max-depth 10
 
 # Forward trace (requires kupmios)
-utxo-tracer trace abc123def456...#0 \
+utxo-tracer trace-utxo abc123def456...#0 \
     --provider kupmios \
     --direction forward \
     --max-depth 10
 
 # Trace backward AND forward from the same UTXO
-utxo-tracer trace abc123def456...#0 \
+utxo-tracer trace-utxo abc123def456...#0 \
     --provider kupmios \
     --direction both
 ```
@@ -270,16 +274,16 @@ utxo-tracer trace abc123def456...#0 \
 
 ```bash
 # Default table
-utxo-tracer trace abc123...#0
+utxo-tracer trace-utxo abc123...#0
 
 # JSON to stdout
-utxo-tracer trace abc123...#0 --output json
+utxo-tracer trace-utxo abc123...#0 --output json
 
 # CSV files
-utxo-tracer trace abc123...#0 --output csv --export-csv ./my_trace
+utxo-tracer trace-utxo abc123...#0 --output csv --export-csv ./my_trace
 
 # Export to JSON file
-utxo-tracer trace abc123...#0 --export-json trace.json
+utxo-tracer trace-utxo abc123...#0 --export-json trace.json
 ```
 
 ### Options
@@ -319,7 +323,7 @@ utxo-tracer open <cache-key>
 
 ```bash
 # Load CEX addresses from a JSON file
-utxo-tracer trace abc123...#0 --cex-file ./cex_registry.json
+utxo-tracer trace-utxo abc123...#0 --cex-file ./cex_registry.json
 ```
 
 The JSON file format:
@@ -343,19 +347,27 @@ Or as a list:
 ### Fallback chain
 
 By default, fallback is enabled. If the primary provider fails, the tool tries:
-`primary → utxorpc → blockfrost → koios → maestro`
+`primary → blockfrost → koios → maestro → utxorpc`
+(kupmios and minibf are excluded from auto-fallback — they require explicit local URLs.)
 
 Transient errors (timeouts, connection failures) are retried with exponential backoff (0.5s, 1s, 2s). Non-transient errors propagate immediately.
 
-### UTxORPC (recommended)
+### UTxORPC
 
-High-throughput gRPC provider supports both backward and forward tracing. Can be self-hosted or used via Demeter.run.
+High-throughput gRPC provider. **Backward tracing only** — forward depends on
+`DumpHistory`, which many endpoints (e.g. Demeter.run) do not expose. Can be
+self-hosted (Dolos) or used via Demeter.run. The URL scheme selects the
+transport: `https://` → TLS, `http://` → plaintext.
 
 ```bash
-# Demeter.run
-BLOCKFROST_AUTH_TYPE=dmtr-api-key BLOCKFROST_API_KEY=dmtr_XXX \
-BLOCKFROST_ENDPOINT_URL=https://cardano-mainnet.blockfrost.io/api/v0 \
-utxo-tracer trace abc123...#0 --provider blockfrost
+# Demeter.run (TLS) — gRPC endpoint + key
+UTXORPC_ENDPOINT_URL=https://<your-endpoint>.demeter.run \
+UTXORPC_API_KEY=dmtr_XXX \
+utxo-tracer trace-utxo abc123...#0 --provider utxorpc
+
+# Self-hosted Dolos (plaintext gRPC)
+utxo-tracer trace-utxo abc123...#0 --provider utxorpc \
+    --endpoint-url http://localhost:50051
 ```
 
 ### Kupmios (local node)
@@ -363,7 +375,7 @@ utxo-tracer trace abc123...#0 --provider blockfrost
 The only provider that supports native forward tracing. Requires a running [Kupo](https://github.com/cardanosolutions/kupo) and [Ogmios](https://ogmios.dev) instance.
 
 ```bash
-utxo-tracer trace abc123...#0 \
+utxo-tracer trace-utxo abc123...#0 \
     --provider kupmios \
     --kupo-url http://localhost:1442 \
     --ogmios-url http://localhost:1337 \
@@ -464,7 +476,7 @@ Use `--no-cache` to skip local cache entirely and always query providers.
 ## Architecture
 
 ```
-utxo-tracer trace <tx_hash>#<output_index>
+utxo-tracer trace-utxo <tx_hash>#<output_index>
       │
       ▼
    ┌─────────────────────────────────────────┐
@@ -525,10 +537,11 @@ src/utxo_tracer/
 ├── tracing/
 │   ├── __init__.py            # build_graph_from_steps()
 │   ├── backward.py            # Backward trace engine
-│   └── forward.py             # Forward trace engine
+│   ├── forward.py             # Forward trace engine
+│   └── address_interactions.py # Address-interaction trace engine
 └── graph/
     ├── __init__.py
-    └── dash_app.py            # Dash Cytoscape visualization
+    └── g6_viz.py              # Interactive graph visualization server
 ```
 
 ---
@@ -554,7 +567,9 @@ pip install -e .
 
 ### Testing
 
-Tests use `aiken check -m` conventions (see project-level test infrastructure).
+```bash
+python -m pytest -q
+```
 
 ---
 

@@ -42,16 +42,22 @@ class UTxORPCProvider(Provider):
         self.api_key = api_key
         self._timeout = timeout
 
-        # Build URI for SDK — endpoint_url takes priority but must be valid
+        # Build URI for SDK — endpoint_url takes priority but must be valid.
+        # Scheme decides transport: http:// (or grpc://) → plaintext insecure
+        # channel (self-hosted Dolos on :50051), https:// → TLS secure channel
+        # (Demeter.run et al.). No scheme defaults to https/TLS.
         raw_url = endpoint_url or base_url or ""
         if not raw_url:
             self._uri = ""
+            self._secure = True
         else:
             if "://" not in raw_url:
                 raw_url = "https://" + raw_url
             parsed = urlparse(raw_url)
+            scheme = (parsed.scheme or "https").lower()
+            self._secure = scheme in ("https", "grpcs")
             host = parsed.hostname or ""
-            port = parsed.port or 443
+            port = parsed.port or (443 if self._secure else 80)
             self._uri = f"{host}:{port}"
 
         # SDK clients (lazy)
@@ -107,6 +113,7 @@ class UTxORPCProvider(Provider):
             self._query_client = CardanoQueryClient(
                 uri=self._uri,
                 metadata=self._metadata(),
+                secure=self._secure,
             )
             self._qc_cm = self._query_client.async_connect()
             await self._qc_cm.__aenter__()
@@ -135,6 +142,7 @@ class UTxORPCProvider(Provider):
             self._sync_client = CardanoSyncClient(
                 uri=self._uri,
                 metadata=self._metadata(),
+                secure=self._secure,
             )
             self._sc_cm = self._sync_client.async_connect()
             await self._sc_cm.__aenter__()
@@ -151,17 +159,6 @@ class UTxORPCProvider(Provider):
         self._query_client = None
         self._sync_client = None
 
-    async def _enter(self) -> "UTxORPCProvider":
-        """Connect SDK clients (called by __aenter__)."""
-        return self
-
-    async def _exit(self, *args) -> None:
-        """Disconnect (called by __aexit__)."""
-        await self.aclose()
-
-    __aenter__ = _enter
-    __aexit__ = _exit
-
     # ── Health check ──────────────────────────────────────────────────
 
     async def health_check(self) -> bool:
@@ -176,7 +173,7 @@ class UTxORPCProvider(Provider):
     # ── Single UTXO lookup ────────────────────────────────────────────
 
     async def get_utxo_by_out_ref(self, out_ref: OutRef) -> Optional[UTxONode]:
-        from utxorpc.v1alpha.query.query_pb2 import TxoRef
+        from utxorpc_spec.utxorpc.v1alpha.query.query_pb2 import TxoRef
 
         qc = await self._get_query_client()
         tx_hash_bytes = bytes.fromhex(out_ref.tx_hash)
@@ -223,7 +220,7 @@ class UTxORPCProvider(Provider):
         return result
 
     async def _probe_outputs(self, qc, tx_hash: str) -> list:
-        from utxorpc.v1alpha.query.query_pb2 import TxoRef
+        from utxorpc_spec.utxorpc.v1alpha.query.query_pb2 import TxoRef
 
         tx_hash_bytes = bytes.fromhex(tx_hash)
         keys = [
@@ -351,7 +348,7 @@ class UTxORPCProvider(Provider):
 
     async def get_spent_utxos(self, address: str) -> list:
         try:
-            from utxorpc.v1alpha.query import query_pb2 as q_pb2
+            from utxorpc_spec.utxorpc.v1alpha.query import query_pb2 as q_pb2
         except ImportError as e:
             raise NotImplementedError(
                 f"UTxORPC SDK import failed: {e}"

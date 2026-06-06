@@ -140,37 +140,44 @@ class MaestroProvider(Provider):
     async def get_address_transactions(self, address: str) -> list[str]:
         """Return all transaction hashes involving this address via Maestro.
 
-        Paginates through all pages to get complete transaction history.
+        Maestro uses CURSOR pagination, not numeric pages: each response carries
+        a ``next_cursor`` that must be passed back as the ``cursor`` query param,
+        and iteration ends when ``next_cursor`` is null/absent. (Maestro ignores
+        a numeric ``page`` param — the old loop re-fetched the first 100 txs
+        forever and dropped every tx beyond the first page.)
         """
         all_hashes: set[str] = set()
-        page = 1
+        cursor: Optional[str] = None
         page_size = 100
-        max_pages = 500
+        max_pages = 500  # safety cap (~50k txs)
         try:
-            while page <= max_pages:
+            for _ in range(max_pages):
+                params: dict = {"count": page_size}
+                if cursor:
+                    params["cursor"] = cursor
                 r = await self._client.get(
-                    f"/addresses/{address}/transactions",
-                    params={"count": page_size, "page": page},
+                    f"/addresses/{address}/transactions", params=params
                 )
                 if r.status_code == 404:
                     break
                 r.raise_for_status()
-                data = r.json()
-                if isinstance(data, dict) and "data" in data:
-                    data = data["data"]
-                if not isinstance(data, list) or not data:
+                body = r.json()
+                if isinstance(body, dict):
+                    data = body.get("data", [])
+                    cursor = body.get("next_cursor")
+                else:
+                    data = body
+                    cursor = None
+                if isinstance(data, list):
+                    all_hashes.update(
+                        tx.get("tx_hash", "") for tx in data if tx.get("tx_hash")
+                    )
+                if not cursor:
                     break
-                new_hashes = {tx.get("tx_hash", "") for tx in data if tx.get("tx_hash")}
-                if not new_hashes:
-                    break
-                all_hashes.update(new_hashes)
-                if len(data) < page_size:
-                    break
-                page += 1
             return list(all_hashes)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 raise
-            return list(all_hashes) if all_hashes else []
+            return list(all_hashes)
         except Exception:
-            return list(all_hashes) if all_hashes else []
+            return list(all_hashes)

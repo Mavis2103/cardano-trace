@@ -44,6 +44,19 @@ logger = logging.getLogger(__name__)
 console = Console()
 err_console = Console(stderr=True)
 
+# ── Provider option vocabulary (single source of truth) ───────────────
+# Every command that talks to a provider reuses these so the CLI surface
+# (choices, names) stays identical across `trace`, `trace-address`,
+# `health`, `assets`, and `config set`.
+PROVIDER_CHOICES = ["blockfrost", "koios", "maestro", "kupmios", "utxorpc", "minibf"]
+AUTH_TYPE_CHOICES = ["project_id", "bearer", "dmtr-api-key"]
+
+# Default provider chain tried when --fallback is on (the default).
+# kupmios (self-hosted Kupo+Ogmios) and minibf (local Dolos) are intentionally
+# excluded: they need explicit local URLs, so auto-falling-back to them would
+# only add guaranteed-failing attempts. Select them explicitly via --provider.
+FALLBACK_ORDER = ["blockfrost", "koios", "maestro", "utxorpc"]
+
 
 def _fatal(msg: str, exit_code: int = 1) -> NoReturn:
     err_console.print(f"[bold red]Error:[/bold red] {msg}")
@@ -70,6 +83,88 @@ def _dataclass_to_dict(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _dataclass_to_dict(v) for k, v in obj.items()}
     return obj
+
+
+def connection_options(func):
+    """Attach the shared provider-connection options to a command.
+
+    Every command that builds a provider stacks the *same* connection flags
+    (provider selection, credentials, endpoint/URL overrides, proxy). Defining
+    them once here keeps the option surface identical across commands and means
+    a new flag only has to be added in one place.
+
+    Note: ``--fallback/--no-fallback`` is NOT included — it is command-specific
+    (``trace``/``trace-address``/``health`` opt in; ``assets`` does not).
+    """
+    options = [
+        click.option(
+            "--provider",
+            type=click.Choice(PROVIDER_CHOICES),
+            default=None,
+            help="Data provider. Defaults to config/env, else 'utxorpc'.",
+        ),
+        click.option(
+            "--api-key",
+            type=str,
+            default=None,
+            help="Provider API key. Comma-separate several to rotate on 429.",
+        ),
+        click.option("--base-url", type=str, default=None, help="Override provider base URL."),
+        click.option(
+            "--auth-type",
+            type=click.Choice(AUTH_TYPE_CHOICES),
+            default=None,
+            help="Auth scheme for blockfrost/minibf.",
+        ),
+        click.option(
+            "--endpoint-url", type=str, default=None, help="Demeter/UTxORPC endpoint URL."
+        ),
+        click.option(
+            "--kupo-url", type=str, default=None, help="Kupo URL(s) for kupmios (comma-separate)."
+        ),
+        click.option(
+            "--ogmios-url",
+            type=str,
+            default=None,
+            help="Ogmios URL(s) for kupmios (comma-separate).",
+        ),
+        click.option(
+            "--use-proxy/--no-proxy", default=False, help="Route HTTP providers through a proxy."
+        ),
+        click.option(
+            "--proxy-url",
+            type=str,
+            default="http://localhost:3001",
+            help="Proxy base URL when --use-proxy is set.",
+        ),
+    ]
+    for option in reversed(options):
+        func = option(func)
+    return func
+
+
+def _collect_overrides(
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    auth_type: Optional[str] = None,
+    endpoint_url: Optional[str] = None,
+    kupo_url: Optional[str] = None,
+    ogmios_url: Optional[str] = None,
+) -> dict:
+    """Build a provider-override dict from CLI flags, dropping unset (None) values."""
+    return {
+        k: v
+        for k, v in {
+            "api_key": api_key,
+            "base_url": base_url,
+            "auth_type": auth_type,
+            "endpoint_url": endpoint_url,
+            "kupo_url": kupo_url,
+            "ogmios_url": ogmios_url,
+        }.items()
+        if v is not None
+    }
 
 
 def _resolve_provider_name(cli_provider: Optional[str], cfg: dict) -> str:
@@ -100,15 +195,14 @@ def _build_providers(
     proxy_url: str,
 ) -> Provider:
     provider_cfg = (cfg.get("providers") or {}).get(name, {}) or {}
-    overrides = {
-        "api_key": api_key,
-        "base_url": base_url,
-        "auth_type": auth_type,
-        "endpoint_url": endpoint_url,
-        "kupo_url": kupo_url,
-        "ogmios_url": ogmios_url,
-    }
-    overrides = {k: v for k, v in overrides.items() if v is not None}
+    overrides = _collect_overrides(
+        api_key=api_key,
+        base_url=base_url,
+        auth_type=auth_type,
+        endpoint_url=endpoint_url,
+        kupo_url=kupo_url,
+        ogmios_url=ogmios_url,
+    )
 
     if not use_fallback:
         return build_provider(
@@ -119,8 +213,7 @@ def _build_providers(
             overrides=overrides,
         )
 
-    _FALLBACK_ORDER = ["blockfrost", "koios", "maestro", "utxorpc"]
-    order = _FALLBACK_ORDER[:]
+    order = FALLBACK_ORDER[:]
     if name in order:
         order.remove(name)
     order.insert(0, name)
@@ -671,9 +764,10 @@ FALLBACK
 CONFIG PRIORITY  CLI flags > shell env > .env file > config.json
 
 EXAMPLES
-  utxo-tracer trace abc123...#0 --provider blockfrost --api-key mainnet_XXX
-  utxo-tracer trace abc123...#0
-  utxo-tracer trace abc123...#0 --provider kupmios --direction forward
+  utxo-tracer trace-utxo abc123...#0 --provider blockfrost --api-key mainnet_XXX
+  utxo-tracer trace-utxo abc123...#0
+  utxo-tracer trace-utxo abc123...#0 --provider kupmios --direction forward
+  utxo-tracer trace-address addr1...        (trace an address's interactions)
 """
 
 
@@ -683,23 +777,9 @@ def main() -> None:
     pass
 
 
-@main.command("trace", help="Trace a UTXO backwards/forwards through the chain.")
+@main.command("trace-utxo", help="Trace a UTXO backwards/forwards through the chain.")
 @click.argument("utxo", type=str)
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
-@click.option("--api-key", type=str, default=None)
-@click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
-@click.option("--endpoint-url", type=str, default=None)
-@click.option("--kupo-url", type=str, default=None)
-@click.option("--ogmios-url", type=str, default=None)
+@connection_options
 @click.option(
     "--direction", type=click.Choice(["backward", "forward", "both"]), default=None
 )
@@ -711,8 +791,6 @@ def main() -> None:
 @click.option("--cex-file", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.option("--depth-report", is_flag=True, default=False)
 @click.option("--dash/--no-dash", default=True, hidden=True)
-@click.option("--use-proxy/--no-proxy", default=False)
-@click.option("--proxy-url", type=str, default="http://localhost:3001")
 @click.option(
     "--no-cache",
     is_flag=True,
@@ -812,14 +890,6 @@ def trace_cmd(
     if not no_cache:
         trace_key = cache_mod._cache_key(start, direction, max_depth)
     provider_name = _resolve_provider_name(provider, cfg)
-    if direction in ("forward", "both") and provider_name not in (
-        "kupmios",
-        "blockfrost",
-        "koios",
-    ):
-        _fatal(
-            f"Forward tracing requires --provider kupmios, blockfrost, or koios (got '{provider_name}')."
-        )
     prov = _build_providers(
         provider_name,
         cfg,
@@ -833,6 +903,17 @@ def trace_cmd(
         use_proxy=use_proxy,
         proxy_url=proxy_url,
     )
+    # Gate forward tracing on the real provider CAPABILITY (the single source
+    # of truth shared with the tracer in tracing/forward.py), not a hardcoded
+    # name list — so minibf, rotating-key wrappers, and fallback chains (which
+    # report the capability of what they wrap) are all judged correctly.
+    if direction in ("forward", "both") and not getattr(
+        prov, "supports_forward", False
+    ):
+        _fatal(
+            f"Forward tracing is not supported by provider '{provider_name}'. "
+            f"Use blockfrost, koios, or kupmios (optionally with --fallback)."
+        )
 
     async def _runner() -> TraceResult:
         async with prov as p:
@@ -890,26 +971,49 @@ def trace_cmd(
 # ── trace-address command ──────────────────────────────────────
 
 
+def _present_cached_address_result(
+    cached: "AddressTraceResult",
+    *,
+    address: str,
+    direction: str,
+    cex_filter: bool,
+    dash: bool,
+) -> None:
+    """Render a cache-hit address-trace result: optional CEX filter, then the
+    graph dashboard (``--dash``) or the summary tables.
+
+    Shared by both cache-hit paths in ``trace-address`` — the per-step manifest
+    full-hit and the legacy v2 snapshot — which were previously identical
+    copy-pasted blocks.
+    """
+    console.print("[green]Loaded from local cache[/green]")
+    result = cached
+    if cex_filter and result.addresses:
+        n_before = len(result.addresses)
+        result = apply_cex_filter(result)
+        _print_cex_filter_banner(n_before, len(result.addresses))
+    if dash and result.addresses:
+        from .graph.g6_viz import start_address_server
+
+        console.print("[green]Starting graph visualization...[/green]")
+        # browser is opened by the g6 viz server on its actual port
+        start_address_server(
+            result,
+            target_address=address,
+            cache_key=cache_mod._addr_cache_key(address, direction=direction),
+        )
+    else:
+        _print_address_summary(result)
+        _print_address_nodes_table(result)
+        _print_address_interaction_edges(result)
+
+
 @main.command(
     "trace-address",
     help="Trace all addresses that have interacted with a given Cardano address. Supports multiple API keys by comma-separating: --api-key key1,key2,key3",
 )
 @click.argument("address", type=str)
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
-@click.option("--api-key", type=str, default=None)
-@click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
-@click.option("--endpoint-url", type=str, default=None)
-@click.option("--kupo-url", type=str, default=None)
-@click.option("--ogmios-url", type=str, default=None)
+@connection_options
 @click.option(
     "--tx-limit",
     type=int,
@@ -945,8 +1049,6 @@ def trace_cmd(
     "CEXs are discovered (filter will keep only the target).",
 )
 @click.option("--dash/--no-dash", default=True, hidden=True)
-@click.option("--use-proxy/--no-proxy", default=False)
-@click.option("--proxy-url", type=str, default="http://localhost:3001")
 @click.option(
     "--no-cache",
     is_flag=True,
@@ -1021,26 +1123,13 @@ def trace_address_cmd(
                     direction=direction,
                 )
                 if cached is not None:
-                    console.print("[green]Loaded from local cache[/green]")
-                    result = cached
-                    if cex_filter and result.addresses:
-                        n_before = len(result.addresses)
-                        result = apply_cex_filter(result)
-                        _print_cex_filter_banner(n_before, len(result.addresses))
-                    if dash and result.addresses:
-                        from .graph.g6_viz import start_address_server
-
-                        console.print("[green]Starting graph visualization...[/green]")
-                        # browser is opened by the g6 viz server on its actual port
-                        start_address_server(
-                            result,
-                            target_address=address,
-                            cache_key=cache_mod._addr_cache_key(address, direction=direction),
-                        )
-                    else:
-                        _print_address_summary(result)
-                        _print_address_nodes_table(result)
-                        _print_address_interaction_edges(result)
+                    _present_cached_address_result(
+                        cached,
+                        address=address,
+                        direction=direction,
+                        cex_filter=cex_filter,
+                        dash=dash,
+                    )
                     return
                 # No v2 snapshot — rebuild from manifest. Cache-serve replays
                 # every already-fetched tx from the global store for free, so
@@ -1082,26 +1171,13 @@ def trace_address_cmd(
                 address, tx_limit=effective_tx_limit, max_depth=max_depth
             )
             if cached is not None:
-                console.print("[green]Loaded from local cache[/green]")
-                result = cached
-                if cex_filter and result.addresses:
-                    n_before = len(result.addresses)
-                    result = apply_cex_filter(result)
-                    _print_cex_filter_banner(n_before, len(result.addresses))
-                if dash and result.addresses:
-                    from .graph.g6_viz import start_address_server
-
-                    console.print("[green]Starting graph visualization...[/green]")
-                    # browser is opened by the g6 viz server on its actual port
-                    start_address_server(
-                        result,
-                        target_address=address,
-                        cache_key=cache_mod._addr_cache_key(address, direction=direction),
-                    )
-                else:
-                    _print_address_summary(result)
-                    _print_address_nodes_table(result)
-                    _print_address_interaction_edges(result)
+                _present_cached_address_result(
+                    cached,
+                    address=address,
+                    direction=direction,
+                    cex_filter=cex_filter,
+                    dash=dash,
+                )
                 return
 
     provider_name = _resolve_provider_name(provider, cfg)
@@ -1632,18 +1708,10 @@ def config_group() -> None:
 
 
 @config_group.command("set")
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    required=True,
-)
+@click.option("--provider", type=click.Choice(PROVIDER_CHOICES), required=True)
 @click.option("--api-key", type=str, default=None)
 @click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
+@click.option("--auth-type", type=click.Choice(AUTH_TYPE_CHOICES), default=None)
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
 @click.option("--ogmios-url", type=str, default=None)
@@ -1708,24 +1776,8 @@ def config_clear() -> None:
     "health",
     help="Check provider connectivity. Without --provider, checks all configured providers.",
 )
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
-@click.option("--api-key", type=str, default=None)
-@click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
-@click.option("--endpoint-url", type=str, default=None)
-@click.option("--kupo-url", type=str, default=None)
-@click.option("--ogmios-url", type=str, default=None)
+@connection_options
 @click.option("--fallback/--no-fallback", default=True)
-@click.option("--use-proxy/--no-proxy", default=False)
-@click.option("--proxy-url", type=str, default="http://localhost:3001")
 def health_cmd(
     provider,
     api_key,
@@ -1739,18 +1791,14 @@ def health_cmd(
     proxy_url,
 ):
     cfg = load_config()
-    overrides = {
-        k: v
-        for k, v in {
-            "api_key": api_key,
-            "base_url": base_url,
-            "auth_type": auth_type,
-            "endpoint_url": endpoint_url,
-            "kupo_url": kupo_url,
-            "ogmios_url": ogmios_url,
-        }.items()
-        if v is not None
-    }
+    overrides = _collect_overrides(
+        api_key=api_key,
+        base_url=base_url,
+        auth_type=auth_type,
+        endpoint_url=endpoint_url,
+        kupo_url=kupo_url,
+        ogmios_url=ogmios_url,
+    )
 
     if provider:
         # ── Single provider mode ─────────────────────────────────
@@ -1824,7 +1872,7 @@ def health_cmd(
         return
 
     # ── All-providers mode ───────────────────────────────────────
-    _ALL_PROVIDERS = ["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]
+    _ALL_PROVIDERS = PROVIDER_CHOICES
     from .providers import build_provider as _build_single
 
     async def _check_one(pname: str) -> tuple[str, bool, str, str]:
@@ -1992,23 +2040,7 @@ def health_cmd(
 
 @main.command("assets", help="Show asset breakdown for a single UTXO.")
 @click.argument("utxo", type=str)
-@click.option(
-    "--provider",
-    type=click.Choice(["blockfrost", "koios", "maestro", "kupmios", "utxorpc"]),
-    default=None,
-)
-@click.option("--api-key", type=str, default=None)
-@click.option("--base-url", type=str, default=None)
-@click.option(
-    "--auth-type",
-    type=click.Choice(["project_id", "bearer", "dmtr-api-key"]),
-    default=None,
-)
-@click.option("--endpoint-url", type=str, default=None)
-@click.option("--kupo-url", type=str, default=None)
-@click.option("--ogmios-url", type=str, default=None)
-@click.option("--use-proxy/--no-proxy", default=False)
-@click.option("--proxy-url", type=str, default="http://localhost:3001")
+@connection_options
 def assets_cmd(
     utxo,
     provider,
@@ -2028,18 +2060,14 @@ def assets_cmd(
         _fatal(str(e))
     provider_name = _resolve_provider_name(provider, cfg)
     provider_cfg = (cfg.get("providers") or {}).get(provider_name, {}) or {}
-    overrides = {
-        k: v
-        for k, v in {
-            "api_key": api_key,
-            "base_url": base_url,
-            "auth_type": auth_type,
-            "endpoint_url": endpoint_url,
-            "kupo_url": kupo_url,
-            "ogmios_url": ogmios_url,
-        }.items()
-        if v is not None
-    }
+    overrides = _collect_overrides(
+        api_key=api_key,
+        base_url=base_url,
+        auth_type=auth_type,
+        endpoint_url=endpoint_url,
+        kupo_url=kupo_url,
+        ogmios_url=ogmios_url,
+    )
     prov = build_provider(
         provider_name,
         provider_cfg,

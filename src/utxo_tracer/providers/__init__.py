@@ -17,6 +17,30 @@ from .utxorpc import UTxORPCProvider
 _LOGGER = logging.getLogger(__name__)
 
 
+def _wrap_multikey(
+    log_name: str,
+    tag_prefix: str,
+    keys: list[str],
+    make: Any,
+) -> Provider:
+    """Build one provider, or a ``RotatingKeyProvider`` when >1 key is given.
+
+    ``make(key)`` constructs a single provider instance for ``key`` — called
+    with ``None`` when no key was supplied, so each factory applies its own
+    default. ``log_name`` / ``tag_prefix`` keep the log line and per-key
+    instance tags identical to the previous hand-rolled blocks.
+    """
+    if len(keys) <= 1:
+        return make(keys[0] if keys else None)
+    instances: list[tuple[str, Provider]] = [
+        (f"{tag_prefix}-{i}", make(key)) for i, key in enumerate(keys)
+    ]
+    _LOGGER.info(
+        "%s: created %d instances for rotating-key provider", log_name, len(keys)
+    )
+    return RotatingKeyProvider(instances)
+
+
 def build_provider(
     name: str,
     cfg: dict[str, Any],
@@ -44,106 +68,58 @@ def build_provider(
         return default
 
     if name == "blockfrost":
-        raw = merged("api_key") or ""
-        keys = split_api_keys(raw)
+        keys = split_api_keys(merged("api_key") or "")
         if not keys:
             _LOGGER.warning(
                 "Blockfrost provider initialized without API key — "
                 "some endpoints may be unavailable"
             )
-        base_url = merged("base_url")
-        if not base_url:
-            base_url = (
-                f"{proxy_url}/api/blockfrost"
-                if use_proxy
-                else "https://cardano-mainnet.blockfrost.io/api/v0"
-            )
+        base_url = merged("base_url") or (
+            f"{proxy_url}/api/blockfrost"
+            if use_proxy
+            else "https://cardano-mainnet.blockfrost.io/api/v0"
+        )
         auth_type = merged("auth_type", "project_id") or "project_id"
         endpoint_url = merged("endpoint_url")
-
-        if len(keys) <= 1:
-            return BlockfrostProvider(
-                api_key=keys[0] if keys else "",
+        return _wrap_multikey(
+            "Blockfrost",
+            "bf-key",
+            keys,
+            lambda k: BlockfrostProvider(
+                api_key=k or "",
                 base_url=base_url,
                 auth_type=auth_type,
                 endpoint_url=endpoint_url,
-            )
-
-        instances: list[tuple[str, Provider]] = []
-        for i, key in enumerate(keys):
-            name_tag = f"bf-key-{i}"
-            instances.append((
-                name_tag,
-                BlockfrostProvider(
-                    api_key=key,
-                    base_url=base_url,
-                    auth_type=auth_type,
-                    endpoint_url=endpoint_url,
-                ),
-            ))
-        _LOGGER.info(
-            "Blockfrost: created %d instances for rotating-key provider",
-            len(keys),
+            ),
         )
-        return RotatingKeyProvider(instances)
 
     if name == "koios":
-        raw = merged("api_key") or ""
-        keys = split_api_keys(raw)
-        base_url = merged("base_url")
-        if not base_url:
-            base_url = (
-                f"{proxy_url}/api/koios"
-                if use_proxy
-                else "https://api.koios.rest/api/v1"
-            )
-
-        if len(keys) <= 1:
-            return KoiosProvider(
-                api_key=keys[0] if keys else None,
-                base_url=base_url,
-            )
-
-        instances: list[tuple[str, Provider]] = []
-        for i, key in enumerate(keys):
-            instances.append((
-                f"koios-key-{i}",
-                KoiosProvider(api_key=key, base_url=base_url),
-            ))
-        _LOGGER.info(
-            "Koios: created %d instances for rotating-key provider",
-            len(keys),
+        keys = split_api_keys(merged("api_key") or "")
+        base_url = merged("base_url") or (
+            f"{proxy_url}/api/koios"
+            if use_proxy
+            else "https://api.koios.rest/api/v1"
         )
-        return RotatingKeyProvider(instances)
+        return _wrap_multikey(
+            "Koios",
+            "koios-key",
+            keys,
+            lambda k: KoiosProvider(api_key=k, base_url=base_url),
+        )
 
     if name == "maestro":
-        raw = merged("api_key") or ""
-        keys = split_api_keys(raw)
-        base_url = merged("base_url")
-        if not base_url:
-            base_url = (
-                f"{proxy_url}/api/maestro"
-                if use_proxy
-                else "https://mainnet.gomaestro-api.org/v1"
-            )
-
-        if len(keys) <= 1:
-            return MaestroProvider(
-                api_key=keys[0] if keys else "",
-                base_url=base_url,
-            )
-
-        instances: list[tuple[str, Provider]] = []
-        for i, key in enumerate(keys):
-            instances.append((
-                f"maestro-key-{i}",
-                MaestroProvider(api_key=key, base_url=base_url),
-            ))
-        _LOGGER.info(
-            "Maestro: created %d instances for rotating-key provider",
-            len(keys),
+        keys = split_api_keys(merged("api_key") or "")
+        base_url = merged("base_url") or (
+            f"{proxy_url}/api/maestro"
+            if use_proxy
+            else "https://mainnet.gomaestro-api.org/v1"
         )
-        return RotatingKeyProvider(instances)
+        return _wrap_multikey(
+            "Maestro",
+            "maestro-key",
+            keys,
+            lambda k: MaestroProvider(api_key=k or "", base_url=base_url),
+        )
 
     if name == "kupmios":
         raw_kupo = merged("kupo_url") or "http://localhost:1442"
@@ -188,6 +164,24 @@ def build_provider(
             n,
         )
         return RotatingKeyProvider(instances)
+
+    if name == "minibf":
+        # Dolos minibf — Blockfrost-compatible REST served at the root path
+        # (no /api/v0 prefix), typically no auth. Reuses the Blockfrost driver.
+        base_url = merged("base_url")
+        if not base_url:
+            base_url = (
+                f"{proxy_url}/api/minibf"
+                if use_proxy
+                else "http://localhost:50053"
+            )
+        auth_type = merged("auth_type", "project_id") or "project_id"
+        return BlockfrostProvider(
+            api_key=merged("api_key") or "",
+            base_url=base_url,
+            auth_type=auth_type,
+            endpoint_url=merged("endpoint_url"),
+        )
 
     if name == "utxorpc":
         return UTxORPCProvider(

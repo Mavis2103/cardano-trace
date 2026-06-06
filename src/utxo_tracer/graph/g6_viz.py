@@ -592,7 +592,18 @@ _JS = r"""
     // other major FPS sink.
     animation: BIG ? false : {duration: 200, easing: 'ease-in-out'},
   });
-  graph.render().then(()=>{ try{ graph.fitView(); }catch(e){} });
+  // Fit the viewport AFTER the layout settles, not when render() resolves:
+  // force layouts keep moving nodes for several ticks past render, so an
+  // immediate fitView() framed the pre-settle positions and left nodes
+  // drifting out of view. Fit once on the first 'afterlayout' (with a
+  // timeout fallback for instant layouts that fire before this handler).
+  let _fittedOnce = false;
+  function _fitOnce(){
+    if(_fittedOnce) return; _fittedOnce = true;
+    try{ graph.fitView({padding: 30}); }catch(e){ try{ graph.fitView(); }catch(_){} }
+  }
+  graph.on('afterlayout', _fitOnce);
+  graph.render().then(()=>{ setTimeout(_fitOnce, 450); });
   window.__graph__ = graph;
   // reflect the chosen default in the layout selector
   try{ document.getElementById('layout').value = DEFAULT_LAYOUT; }catch(e){}
@@ -762,7 +773,10 @@ _JS = r"""
 
   // ---- toolbar ----
   document.getElementById('layout').addEventListener('change', (e)=>{
-    try{ graph.setLayout(layoutOpts(e.target.value)); graph.layout(); }
+    try{
+      graph.setLayout(layoutOpts(e.target.value));
+      graph.layout().then(()=>{ try{ graph.fitView({padding: 30}); }catch(_){} });
+    }
     catch(err){ console.warn('layout', err); }
   });
   document.getElementById('fit').onclick = ()=>{ try{ graph.fitView(); }catch(err){} };
@@ -784,10 +798,12 @@ _JS = r"""
   });
 
   // ---- viz-state persistence (best effort, never breaks rendering) ----
+  // NOTE: we intentionally do NOT re-apply a saved absolute zoom on load. The
+  // old code called graph.zoomTo(savedZoom) WITHOUT restoring the matching pan,
+  // which stranded the camera off the graph (blank/empty viewport) and also
+  // raced the initial fitView. The auto-fit above always frames the graph
+  // correctly; state is still saved below for potential future full restore.
   if(CACHE_KEY){
-    fetch('/viz-state?k='+encodeURIComponent(CACHE_KEY)).then(r=>r.ok?r.json():null)
-      .then(s=>{ if(s && s.zoom){ try{ graph.zoomTo(s.zoom); }catch(err){} } })
-      .catch(()=>{});
     window.addEventListener('beforeunload', ()=>{
       try{
         const positions = {};
