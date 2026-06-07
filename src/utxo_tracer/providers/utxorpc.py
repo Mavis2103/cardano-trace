@@ -122,17 +122,27 @@ class UTxORPCProvider(Provider):
         if not resp.HasField("tx") or not resp.tx.HasField("cardano"):
             return None
         tx = resp.tx.cardano
-        inputs = [
-            OutRef(tx_hash=inp.tx_hash.hex(), output_index=inp.output_index)
-            for inp in tx.inputs
-            if inp.tx_hash
-        ]
+        inputs: list[OutRef] = []
+        input_utxos: dict[str, UTxONode] = {}
+        for inp in tx.inputs:
+            if not inp.tx_hash:
+                continue
+            out_ref = OutRef(tx_hash=inp.tx_hash.hex(), output_index=inp.output_index)
+            inputs.append(out_ref)
+            # Extract full UTxONode from as_output (contains address + coin).
+            # Without this, address tracing has no input addresses → 0 edges.
+            if inp.HasField("as_output"):
+                node = self._parse_tx_output(
+                    inp.tx_hash.hex(), inp.as_output, inp.output_index
+                )
+                if node:
+                    input_utxos[out_ref.node_id()] = node
         outputs = [
             node
             for idx, out in enumerate(tx.outputs)
             if (node := self._parse_tx_output(tx_hash, out, idx)) is not None
         ]
-        return {"inputs": inputs, "outputs": outputs}
+        return {"inputs": inputs, "input_utxos": input_utxos, "outputs": outputs}
 
     async def _get_query_client(self):
         if self._query_client is not None:

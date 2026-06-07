@@ -110,27 +110,25 @@ class KoiosProvider(Provider):
     async def get_transaction_utxos(self, tx_hash: str) -> dict:
         try:
             body = {"_tx_hashes": [tx_hash]}
-            r = await self._client.post("/tx_info", json=body)
+            r = await self._client.post("/tx_utxos", json=body)
             if r.status_code == 404:
-                return {"inputs": [], "outputs": []}
+                return {"inputs": [], "input_utxos": {}, "outputs": []}
             r.raise_for_status()
             arr = r.json()
             if not arr:
-                return {"inputs": [], "outputs": []}
+                return {"inputs": [], "input_utxos": {}, "outputs": []}
             if len(arr) > 1:
                 _LOGGER.warning(
-                    "Koios tx_info returned %d txs for hash %s, using first",
+                    "Koios tx_utxos returned %d txs for hash %s, using first",
                     len(arr),
                     tx_hash,
                 )
-            return self._parse_tx_info(arr[0], tx_hash)
+            return self._parse_tx_utxos(arr[0], tx_hash)
         except Exception:
-            return {"inputs": [], "outputs": []}
+            return {"inputs": [], "input_utxos": {}, "outputs": []}
 
-    async def get_transactions_utxos(
-        self, tx_hashes: list[str]
-    ) -> list[dict]:
-        """Batch-fetch UTXO details for multiple transactions via Koios /tx_info.
+    async def get_transactions_utxos(self, tx_hashes: list[str]) -> list[dict]:
+        """Batch-fetch UTXO details for multiple transactions via Koios /tx_utxos.
 
         Sends up to 100 tx hashes in a single POST request.
         Falls back to sequential calls for empty/unexpected responses.
@@ -140,13 +138,17 @@ class KoiosProvider(Provider):
 
         try:
             body = {"_tx_hashes": tx_hashes}
-            r = await self._client.post("/tx_info", json=body)
+            r = await self._client.post("/tx_utxos", json=body)
             if r.status_code == 404:
-                return [{"inputs": [], "outputs": []} for _ in tx_hashes]
+                return [
+                    {"inputs": [], "input_utxos": {}, "outputs": []} for _ in tx_hashes
+                ]
             r.raise_for_status()
             arr = r.json()
             if not arr:
-                return [{"inputs": [], "outputs": []} for _ in tx_hashes]
+                return [
+                    {"inputs": [], "input_utxos": {}, "outputs": []} for _ in tx_hashes
+                ]
         except Exception:
             # Fall back to parent sequential per-tx fetching
             return await super().get_transactions_utxos(tx_hashes)
@@ -165,13 +167,13 @@ class KoiosProvider(Provider):
         results: list[dict] = []
         for tx_hash in tx_hashes:
             if tx_hash in tx_map:
-                results.append(self._parse_tx_info(tx_map[tx_hash], tx_hash))
+                results.append(self._parse_tx_utxos(tx_map[tx_hash], tx_hash))
             else:
-                results.append({"inputs": [], "outputs": []})
+                results.append({"inputs": [], "input_utxos": {}, "outputs": []})
         return results
 
-    def _parse_tx_info(self, tx: dict, tx_hash: str) -> dict:
-        """Parse a single tx_info response into standard format."""
+    def _parse_tx_utxos(self, tx: dict, tx_hash: str) -> dict:
+        """Parse a single tx_utxos response into standard format."""
         inputs: list[OutRef] = []
         input_utxos: dict[str, UTxONode] = {}
         for i in tx.get("inputs", []) or []:

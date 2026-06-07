@@ -63,7 +63,6 @@ def _same_wallet(a: str, b: str) -> bool:
 _TIMEOUT_PER_FETCH = 15.0
 _BATCH_SIZE = 20
 _MAX_TX_LIMIT = 100_000
-_MAX_ADDRESSES = 500  # hard safety cap
 
 
 async def trace_address_interactions(
@@ -142,7 +141,6 @@ async def trace_address_interactions(
     # the first encounter contributes to net/gross/in/out ADA (edges are still
     # recorded every time, then deduped later by (source,target)).
     ada_counted_txs: set[str] = set()
-    truncated = False  # set if the _MAX_ADDRESSES safety cap was hit
 
     # ── BFS loop ─────────────────────────────────────────────────────────
     while queue:
@@ -224,14 +222,6 @@ async def trace_address_interactions(
 
         total_tx_processed += effective_count
         per_addr_tx_count[current_addr] = effective_count
-
-        # Hard cap on total addresses
-        if len(visited_addresses) >= _MAX_ADDRESSES and current_depth > 0:
-            logger.warning(
-                "Reached %d address limit — stopping expansion", _MAX_ADDRESSES
-            )
-            truncated = True
-            break
 
         # ── Step 2: Fetch tx details — try batch, fall back to concurrent ─
         sem = asyncio.Semaphore(25)
@@ -513,13 +503,6 @@ async def trace_address_interactions(
                 direction_relative_to_target=edge_dir,
                 source_depth=min_depth,
             )
-        )
-
-    if truncated:
-        errors.insert(
-            0,
-            f"Reached {_MAX_ADDRESSES}-address safety cap — graph truncated; "
-            f"narrow the trace (lower --max-depth or set --tx-limit)",
         )
 
     if not edges and total_tx_processed > 0 and errors:
