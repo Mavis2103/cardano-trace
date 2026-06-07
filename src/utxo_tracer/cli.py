@@ -52,10 +52,16 @@ PROVIDER_CHOICES = ["blockfrost", "koios", "maestro", "kupmios", "utxorpc", "min
 AUTH_TYPE_CHOICES = ["project_id", "bearer", "dmtr-api-key"]
 
 # Default provider chain tried when --fallback is on (the default).
-# kupmios (self-hosted Kupo+Ogmios) and minibf (local Dolos) are intentionally
-# excluded: they need explicit local URLs, so auto-falling-back to them would
-# only add guaranteed-failing attempts. Select them explicitly via --provider.
-FALLBACK_ORDER = ["blockfrost", "koios", "maestro", "utxorpc"]
+# minibf (local Dolos) sits after utxorpc but is only kept in the chain when a
+# base_url is actually configured — otherwise it would default to localhost and
+# add a guaranteed-failing attempt. kupmios (self-hosted Kupo+Ogmios) stays out
+# of the auto chain entirely; select it explicitly via --provider.
+FALLBACK_ORDER = ["utxorpc", "minibf", "koios", "blockfrost", "maestro"]
+
+# Providers that need an explicit local URL. When auto-added to the fallback
+# chain (i.e. not the user's explicitly chosen primary) they are skipped unless
+# that URL is configured, so an unconfigured local node never adds a dead hop.
+_FALLBACK_REQUIRES_URL = {"minibf": "base_url", "kupmios": "kupo_url"}
 
 
 def _fatal(msg: str, exit_code: int = 1) -> NoReturn:
@@ -221,6 +227,14 @@ def _build_providers(
     providers: list[tuple[str, Provider]] = []
     for pname in order:
         p_cfg = (cfg.get("providers") or {}).get(pname, {}) or {}
+        # Skip auto-added local-node providers (not the chosen primary) when
+        # their required URL is unconfigured — avoids a dead hop in the chain.
+        req = _FALLBACK_REQUIRES_URL.get(pname)
+        if pname != name and req and not (overrides.get(req) or p_cfg.get(req)):
+            logging.getLogger(__name__).debug(
+                "Skipping %s in fallback chain: no %s configured", pname, req
+            )
+            continue
         try:
             p = build_provider(
                 pname,
