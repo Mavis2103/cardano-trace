@@ -483,8 +483,14 @@ _BODY = """
   <div class='muted' id='ocount'></div></div>
 <div id='err'></div>
 <div id='toolbar' class='panel'>
-  <input id='search' placeholder='search addr / hash' size='16'>
-  <button id='relayout'>re-layout</button>
+  <span class='sec' style='margin:0'>Layout</span>
+  <select id='layout' title='layout algorithm'></select>
+  <select id='color' title='node colouring'>
+    <option value='type'>colour: type</option>
+    <option value='community'>colour: community</option>
+  </select>
+  <input id='search' placeholder='search addr / hash' size='14'>
+  <button id='relayout'>re-run</button>
   <button id='labels'>labels</button>
   <button id='fit'>fit</button>
   <button id='png'>PNG</button>
@@ -515,12 +521,19 @@ _JS = r"""
   window.addEventListener('error', (ev)=>{ /* keep going; surfaced per-stage */ });
 
   // ---- load engine (ESM) ----
-  let graphologyMod, fa2Mod, sigmaMod;
+  // Core (graphology + forceatlas2 + sigma) is required; the structured-layout
+  // libs (dagre = hierarchical flow, louvain = community colouring,
+  // graphology-layout = circular) are optional — a load failure just disables
+  // that one menu entry instead of breaking the whole viz.
+  let graphologyMod, fa2Mod, sigmaMod, dagreMod, louvainMod, glayoutMod;
   try {
-    [graphologyMod, fa2Mod, sigmaMod] = await Promise.all([
+    [graphologyMod, fa2Mod, sigmaMod, dagreMod, louvainMod, glayoutMod] = await Promise.all([
       import(ESM+'graphology@0.25.4'),
       import(ESM+'graphology-layout-forceatlas2@0.10.1'),
       import(ESM+'sigma@3.0.0'),
+      import(ESM+'@dagrejs/dagre@1').catch(()=>null),
+      import(ESM+'graphology-communities-louvain@2.0.1').catch(()=>null),
+      import(ESM+'graphology-layout@0.6.1').catch(()=>null),
     ]);
   } catch(err){ fatal('engine import: '+err.message); return; }
   const Graph = graphologyMod.MultiDirectedGraph ||
@@ -528,6 +541,9 @@ _JS = r"""
                 graphologyMod.default;
   const FA2 = fa2Mod.default || fa2Mod;
   const Sigma = sigmaMod.default || sigmaMod;
+  const dagre = dagreMod && (dagreMod.default || dagreMod);
+  const louvain = louvainMod && (louvainMod.default || louvainMod);
+  const glayout = glayoutMod && (glayoutMod.default || glayoutMod);
   if(!Graph || !FA2 || !FA2.assign || !Sigma){ fatal('engine exports missing'); return; }
 
   // ---- fetch payload (served separately so huge graphs don't block parse) ----
@@ -542,6 +558,16 @@ _JS = r"""
                       stake:'#3fb950',unknown:'#8b949e'};
   const N = P.nodes.length;
   const BIG = N > 400;
+  // Dense graphs read as an edge "wash" that hides the nodes. Drawing the
+  // non-focused edges at low opacity lets the node structure show through; the
+  // hovered node's edges and any highlighted path stay full-strength.
+  const EDGE_ALPHA = N>1200 ? 0.10 : N>400 ? 0.18 : 0.5;
+  function hexA(hex, a){
+    if(!hex || hex[0]!=='#') return hex;
+    let h=hex.slice(1); if(h.length===3) h=h.split('').map(c=>c+c).join('');
+    const n=parseInt(h,16);
+    return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';
+  }
 
   // ---- build graphology graph ----
   const g = new Graph();
@@ -586,39 +612,147 @@ _JS = r"""
     }catch(_){ /* parallel/dup edge key collisions: skip safely */ }
   });
 
-  // ---- force layout: run ONCE, chunked with progress, unless cached ----
+  // ===================================================================
+  //  LAYOUT SUBSYSTEM
+  //  A force layout alone turns a large directed trace into an unreadable
+  //  hairball. These graphs have real structure — a root/target and a depth
+  //  (hop distance) hierarchy — so we exploit it with several layouts and a
+  //  smart per-kind default:
+  //    • flow (dagre)  : Sugiyama hierarchical, crossing-minimised — best for
+  //                      UTXO money-flow; this is the "organised" look.
+  //    • layered (fast): BFS-depth columns + barycentre crossing reduction,
+  //                      O(N+E) so it scales to 100k nodes instantly.
+  //    • radial        : concentric rings by depth around the target — best
+  //                      for hub-and-spoke address graphs.
+  //    • force (clustered): ForceAtlas2 LinLog + outbound-attraction, which
+  //                      separates communities far better than plain FA2.
+  //    • force (organic): plain FA2 (the previous behaviour).
+  //    • circular      : every node on one ring (overview).
+  // ===================================================================
   function showOverlay(t){ $('overlay').style.display='flex'; if(t)$('ostat').textContent=t; }
   function setBar(p,label){ $('barfill').style.width=p+'%'; if(label)$('ocount').textContent=label; }
   function hideOverlay(){ $('overlay').style.display='none'; }
+  const frame = ()=>new Promise(r=>requestAnimationFrame(r));
+  const STAT = N.toLocaleString()+' nodes · '+P.edges.length.toLocaleString()+' edges';
 
-  async function applyCachedOrLayout(){
-    // try cached positions first → instant open
+  // ---- depth = hop distance from the root/target (undirected BFS) ----
+  const START = (P.start_id && g.hasNode(P.start_id)) ? P.start_id : null;
+  const depth = {};
+  (function computeDepth(){
+    g.forEachNode(id=>{ depth[id] = Infinity; });
+    if(START){
+      depth[START] = 0; let fr=[START];
+      while(fr.length){ const nx=[];
+        fr.forEach(u=>{ g.forEachNeighbor(u,(v)=>{ if(depth[v] > depth[u]+1){ depth[v]=depth[u]+1; nx.push(v); } }); });
+        fr=nx;
+      }
+    }
+    // anything unreached (or no START) falls back to its stored hop-depth
+    g.forEachNode((id,a)=>{ if(!isFinite(depth[id])){ const d=(a.raw&&a.raw.depth!=null)?a.raw.depth:0; depth[id]=d; } });
+  })();
+  function byDepth(){ const m={}; g.forEachNode(id=>{ const d=depth[id]||0; (m[d]=m[d]||[]).push(id); }); return m; }
+  function barycentre(id){ let s=0,c=0; g.forEachNeighbor(id,(v)=>{ s+=g.getNodeAttribute(v,'y')||0; c++; }); return c?s/c:(g.getNodeAttribute(id,'y')||0); }
+  // Louvain communities — computed once, lazily; shared by radial ring ordering
+  // and the "colour: community" toggle.
+  function ensureCommunities(){
+    if(communities===null){ if(louvain){ try{ communities=louvain(g); }catch(_){ communities=false; } } else { communities=false; } }
+    return communities;
+  }
+
+  function layeredLayout(){
+    const m=byDepth(); const ds=Object.keys(m).map(Number).sort((a,b)=>a-b);
+    const XSEP=Math.max(130, 260-N/60), YSEP=Math.max(16, 46-N/220);
+    ds.forEach(d=>{ m[d].forEach((id,i)=>{ g.setNodeAttribute(id,'x',d*XSEP); g.setNodeAttribute(id,'y',i*YSEP); }); });
+    // barycentre sweeps: order each layer by mean neighbour-y to reduce crossings
+    for(let s=0;s<5;s++){ ds.forEach(d=>{ const arr=m[d];
+      arr.sort((a,b)=>barycentre(a)-barycentre(b));
+      arr.forEach((id,i)=>g.setNodeAttribute(id,'y',i*YSEP)); }); }
+    ds.forEach(d=>{ const arr=m[d]; const h=(arr.length-1)*YSEP/2; arr.forEach(id=>g.setNodeAttribute(id,'y',(g.getNodeAttribute(id,'y'))-h)); });
+  }
+  function radialLayout(){
+    const m=byDepth(); const ds=Object.keys(m).map(Number).sort((a,b)=>a-b);
+    const RSEP=Math.max(90, 200-N/90);
+    // group each ring by community so same-community spokes form contiguous
+    // arcs (far less edge crossing than random ring order on a dense hub).
+    const com=ensureCommunities();
+    ds.forEach(d=>{ const arr=m[d]; const R=d*RSEP, n=arr.length;
+      if(com) arr.sort((a,b)=> ((com[a]||0)-(com[b]||0)) || (a<b?-1:1));
+      arr.forEach((id,i)=>{ const a=(i/Math.max(1,n))*2*Math.PI;
+        const rr = R||(ds.length>1?0:1);
+        g.setNodeAttribute(id,'x',Math.cos(a)*rr); g.setNodeAttribute(id,'y',Math.sin(a)*rr); }); });
+  }
+  async function dagreLayout(){
+    if(!dagre){ layeredLayout(); return; }
+    const G=new dagre.graphlib.Graph({multigraph:true,compound:false});
+    G.setGraph({rankdir:'LR', nodesep:16, ranksep:Math.max(45,130-N/90),
+                ranker: N>3000?'longest-path':'tight-tree'});
+    G.setDefaultEdgeLabel(()=>({}));
+    g.forEachNode((id,a)=>{ const s=Math.max(8,(a.size||4)*2.2); G.setNode(id,{width:s,height:s}); });
+    let ei=0; g.forEachEdge((e,a,s,t)=>{ try{ G.setEdge(s,t,{},'d'+(ei++)); }catch(_){} });
+    setBar(40); await frame();
+    dagre.layout(G);
+    g.forEachNode(id=>{ const n=G.node(id); if(n){ g.setNodeAttribute(id,'x',n.x); g.setNodeAttribute(id,'y',-n.y); } });
+  }
+  function seedSpread(){ let i=0; g.forEachNode(id=>{ g.setNodeAttribute(id,'x',Math.cos(i)*(1+i*0.01)); g.setNodeAttribute(id,'y',Math.sin(i)*(1+i*0.01)); i++; }); }
+  async function fa2Layout(mode){
+    seedSpread();
+    const base=FA2.inferSettings(g);
+    const settings = (mode==='linlog')
+      ? Object.assign(base,{linLogMode:true, outboundAttractionDistribution:true, adjustSizes:true, gravity:0.7, scalingRatio:6, barnesHutOptimize:N>500})
+      : Object.assign(base,{adjustSizes:true, gravity:1.2, scalingRatio:12, barnesHutOptimize:N>500});
+    const total = N>6000?120 : N>2000?180 : N>500?280 : 360;
+    let done=0;
+    while(done<total){ try{ FA2.assign(g,{iterations:Math.min(10,total-done),settings}); }catch(_){ break; }
+      done+=10; setBar(Math.round(done/total*100), STAT); await frame(); }
+  }
+
+  const LAYOUTS = {
+    'flow (dagre)':    dagreLayout,
+    'layered (fast)':  async()=>layeredLayout(),
+    'radial':          async()=>radialLayout(),
+    'force (clustered)': ()=>fa2Layout('linlog'),
+    'force (organic)':   ()=>fa2Layout('organic'),
+  };
+  if(!dagre) delete LAYOUTS['flow (dagre)'];
+  if(glayout && glayout.circular) LAYOUTS['circular'] = async()=>glayout.circular.assign(g,{scale:Math.max(250,N*0.6)});
+  // default: UTXO reads best as hierarchical flow; address graphs as radial.
+  // dagre is O(V·E)-ish so very large UTXO graphs fall back to the fast layered.
+  let CURRENT_LAYOUT = (KIND==='utxo')
+    ? ((dagre && N<=4000) ? 'flow (dagre)' : 'layered (fast)')
+    : 'radial';
+
+  async function computeLayout(name){
+    const fn = LAYOUTS[name] || LAYOUTS['layered (fast)'];
+    showOverlay('computing layout: '+name+' …'); setBar(8, STAT); await frame();
+    try{ await fn(); }catch(err){ try{ layeredLayout(); }catch(_){} }
+    g.forEachNode((id,a)=>{ if(!isFinite(a.x)||!isFinite(a.y)){ g.setNodeAttribute(id,'x',Math.random()*100-50); g.setNodeAttribute(id,'y',Math.random()*100-50); } });
+    setBar(100); hideOverlay();
+  }
+
+  // ---- community colouring (Louvain) — adds visible structure on top of any
+  //      layout without collapsing nodes ----
+  let communities=null;
+  const COMM_PALETTE=['#58a6ff','#3fb950','#d29922','#bc8cff','#f85149','#f0883e','#39c5cf','#db61a2','#a371f7','#7ee787','#ffa657','#79c0ff','#ff7b72','#56d364'];
+  function colorBy(mode){
+    if(mode==='community'){
+      const com=ensureCommunities();
+      if(com){ g.forEachNode((id)=>{ const c=com[id]||0; g.setNodeAttribute(id,'color', COMM_PALETTE[c%COMM_PALETTE.length]); }); }
+    } else {
+      g.forEachNode((id,a)=>{ g.setNodeAttribute(id,'color', (a.raw&&a.raw.color)||'#8b949e'); });
+    }
+    if(renderer) renderer.refresh();
+  }
+
+  // ---- initial layout: cached positions → instant; else default layout ----
+  async function initLayout(){
     let cached=null;
     try{ cached = await (await fetch('/viz-state'+(CACHE_KEY?('?k='+encodeURIComponent(CACHE_KEY)):''))).json(); }catch(_){}
-    const pos = cached && cached.node_positions;
-    let applied=0;
-    if(pos){
-      g.forEachNode(id=>{ const p=pos[id]; if(p && isFinite(p.x) && isFinite(p.y)){ g.setNodeAttribute(id,'x',p.x); g.setNodeAttribute(id,'y',p.y); applied++; } });
-    }
-    if(applied >= g.order*0.8 && g.order>0){ return; }  // enough cached → skip FA2
-
-    showOverlay('computing layout…');
-    const total = N>6000?100 : N>2000?160 : N>500?260 : 360;
-    const settings = Object.assign(FA2.inferSettings(g), {
-      barnesHutOptimize: N>500, adjustSizes: true, gravity: 1.2, scalingRatio: 12,
-    });
-    const batch = 10; let done=0;
-    while(done<total){
-      const it = Math.min(batch, total-done);
-      try{ FA2.assign(g, {iterations: it, settings}); }catch(err){ break; }
-      done+=it;
-      setBar(Math.round(done/total*100), N.toLocaleString()+' nodes · '+P.edges.length.toLocaleString()+' edges');
-      await new Promise(r=>requestAnimationFrame(r));
-    }
-    // guard against NaN (isolated nodes)
-    g.forEachNode((id,a)=>{ if(!isFinite(a.x)||!isFinite(a.y)){ g.setNodeAttribute(id,'x',Math.random()*100-50); g.setNodeAttribute(id,'y',Math.random()*100-50); } });
+    const pos = cached && cached.node_positions; let applied=0;
+    if(pos){ g.forEachNode(id=>{ const p=pos[id]; if(p && isFinite(p.x) && isFinite(p.y)){ g.setNodeAttribute(id,'x',p.x); g.setNodeAttribute(id,'y',p.y); applied++; } }); }
+    if(applied >= g.order*0.8 && g.order>0) return;   // enough cached → skip
+    await computeLayout(CURRENT_LAYOUT);
   }
-  try{ await applyCachedOrLayout(); }catch(err){ /* render anyway with seed positions */ }
+  try{ await initLayout(); }catch(err){ /* render anyway with seed positions */ }
 
   // ---- interaction state ----
   let hoveredNode=null, selectedNode=null;
@@ -658,10 +792,15 @@ _JS = r"""
         if(hiddenTypes.size && (hiddenTypes.has(g.getNodeAttribute(s,'atype')) || hiddenTypes.has(g.getNodeAttribute(t,'atype')))){ res.hidden=true; return res; }
         if(pathEdges){
           if(!pathEdges.has(edge)){ res.hidden=true; return res; }
-          res.color=data.baseColor; res.size=(data.baseSize||1)*1.7; res.zIndex=2;
+          res.color=data.baseColor; res.size=(data.baseSize||1)*1.7; res.zIndex=2; res.label='';
+          return res;
         }
-        // edge labels declutter: only the hovered node's incident edges show them
-        res.label = (hoveredNode && (s===hoveredNode||t===hoveredNode)) ? data.label : '';
+        // dim non-focused edges so nodes stay legible; the hovered node's edges
+        // stay full-strength and show their label (declutter)
+        const incident = hoveredNode && (s===hoveredNode || t===hoveredNode);
+        res.color = incident ? data.baseColor : hexA(data.baseColor, EDGE_ALPHA);
+        res.label = incident ? data.label : '';
+        if(!incident) res.zIndex=0;
         return res;
       },
     });
@@ -782,16 +921,19 @@ _JS = r"""
   });
 
   // ---- toolbar ----
+  // populate the layout menu from whichever layouts are available, select default
+  (function fillLayouts(){
+    const sel=$('layout'); if(!sel) return;
+    Object.keys(LAYOUTS).forEach(name=>{ const o=document.createElement('option'); o.value=name; o.textContent=name; sel.appendChild(o); });
+    sel.value=CURRENT_LAYOUT;
+    sel.addEventListener('change', async (e)=>{ CURRENT_LAYOUT=e.target.value;
+      await computeLayout(CURRENT_LAYOUT); renderer.refresh(); renderer.getCamera().animatedReset({duration:300}); });
+  })();
+  $('color').addEventListener('change', (e)=>colorBy(e.target.value));
   $('fit').onclick=()=>{ try{ renderer.getCamera().animatedReset({duration:300}); }catch(_){} };
   $('labels').onclick=()=>{ const v=!renderer.getSetting('renderLabels'); renderer.setSetting('renderLabels',v); };
   $('clear').onclick=()=>{ clearHighlight(); detail.style.display='none'; renderer.refresh(); };
-  $('relayout').onclick=async ()=>{ try{
-    showOverlay('re-computing layout…');
-    const settings=Object.assign(FA2.inferSettings(g),{barnesHutOptimize:N>500,adjustSizes:true,gravity:1.2,scalingRatio:12});
-    let done=0; const total=N>2000?160:300;
-    while(done<total){ FA2.assign(g,{iterations:10,settings}); done+=10; setBar(Math.round(done/total*100)); await new Promise(r=>requestAnimationFrame(r)); }
-    hideOverlay(); renderer.refresh(); renderer.getCamera().animatedReset({duration:300});
-  }catch(err){ hideOverlay(); } };
+  $('relayout').onclick=async ()=>{ await computeLayout(CURRENT_LAYOUT); renderer.refresh(); renderer.getCamera().animatedReset({duration:300}); };
   $('png').onclick=()=>{ try{
     const canvases=renderer.getCanvases(); const {width,height}=renderer.getDimensions();
     const out=document.createElement('canvas'); out.width=width; out.height=height;
