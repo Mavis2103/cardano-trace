@@ -1,8 +1,12 @@
 # UTXO Tracer
 
-**Trace funds across the Cardano blockchain — backward from inputs, forward through spent outputs.**
+**Trace funds across the Cardano blockchain — follow a single UTXO backward/forward, or trace all addresses interacting with a target wallet.**
 
-A CLI tool and interactive graph visualizer for following UTXO chains. Supports multiple blockchain data providers with automatic fallback, CEX address detection, and an interactive Dash Cytoscape graph.
+A CLI tool and interactive graph visualizer for two kinds of chain tracing:
+- **UTXO tracing** (`trace-utxo`) — walk a single UTXO backward through inputs or forward through spends (chain-following)
+- **Address tracing** (`trace-address`) — find all addresses that have interacted with a given address (interaction graph)
+
+Supports multiple blockchain data providers with automatic fallback, CEX address detection, and an interactive Dash Cytoscape graph.
 
 ---
 
@@ -12,12 +16,13 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 | Feature | Description |
 |---------|-------------|
 | **Backward tracing** | Walk backward from a UTXO through transaction inputs. Finds where funds **came from** — CEX withdrawal, mining reward, initial distribution. |
-| **Forward tracing** | Walk forward through spent outputs. Finds where funds **went** — hacker wallet chain → CEX deposit. Requires kupmios. |
+| **Forward tracing** | Walk forward through spent outputs. Finds where funds **went** — hacker wallet chain → CEX deposit. Supported by blockfrost / koios / kupmios / minibf. |
 | **Both directions** | Runs backward then forward from the same starting UTXO. Graph shows cash-in and cash-out edges in different colors. |
 | **Edge-based deduplication** | Preserves all branches of diamond-shaped transaction patterns (both A→X and B→X edges kept). |
 | **Async generators** | Non-blocking streaming trace steps with incremental store updates. |
 | **Global store cache** | Accumulates UTXOs/edges across traces — accelerates future traces that revisit the same transactions with zero provider queries. |
 | **Input UTXO pre-caching** | When a provider returns full UTXO data alongside input refs, cache it immediately to avoid separate API calls later. |
+| **Address interaction tracing** | Follow all addresses that interact with a target address. Unlike UTXO tracing (single chain), this builds an interaction graph of all counterparties — useful for 'who does this address deal with' investigations. |
 
 ### Providers
 | Provider | Type | Backward | Forward | Address | Auth |
@@ -25,25 +30,31 @@ A CLI tool and interactive graph visualizer for following UTXO chains. Supports 
 | **Blockfrost** | REST API | ✓ | ✓ | ✓ | `project_id` / `bearer` / `dmtr-api-key` |
 | **Koios** | REST API | ✓ | ✓ | ✓ | Bearer token (optional) |
 | **Maestro** | REST API | ✓ | ✗ | ✓ | `api-key` |
-| **Kupmios** | Kupo + Ogmios | ✓ | ✓ | ✓ | Optional per-service (`dmtr-api-key` / Bearer) |
+| **Kupmios** | Kupo | ✗ | ✓ | ✓ | Optional (`dmtr-api-key` / Bearer) |
 | **UTxORPC** | gRPC SDK | ✓ | ✗ | ✗ | `x-api-key` / `dmtr-api-key` |
 | **minibf** (Dolos) | REST API | ✓ | ✓ | ✓ | usually none (`project_id` optional) |
 
-Forward tracing is gated on the provider's real capability (`supports_forward`), so blockfrost / koios / kupmios / minibf can trace forward; maestro and utxorpc are backward-only.
+Backward and forward tracing are each gated on the provider's real capability
+(`supports_backward` / `supports_forward`):
+- **Forward**: blockfrost / koios / kupmios / minibf. (maestro, utxorpc: no forward.)
+- **Backward**: blockfrost / koios / maestro / utxorpc / minibf. **kupmios cannot
+  trace backward** — Kupo indexes outputs/UTXOs but has no query for a
+  transaction's inputs (and Ogmios has no such method either), so backward traces
+  fall back to a backward-capable provider.
 
 ### Fallback & Resilience
 | Feature | Description |
 |---------|-------------|
-| **Auto-fallback** | Primary → blockfrost → koios → maestro → utxorpc on failure (kupmios/minibf excluded — they need explicit local URLs) |
+| **Auto-fallback** | Primary → utxorpc → minibf → koios → blockfrost → maestro on failure. kupmios is excluded; minibf is included only when its base URL is configured (else it would add a dead local hop). |
 | **Transient retry** | Exponential backoff (0.5s, 1s, 2s) for timeouts, connection errors, gRPC UNAVAILABLE |
-| **Capability-aware** | Skips providers that can't do backward tracing (e.g. DumpHistory unavailable) |
+| **Capability-aware** | For backward traces, skips providers that can't resolve tx inputs (kupmios, or utxorpc when DumpHistory is unavailable) |
 | **Non-transient propagation** | ValueError, TypeError, KeyError, rate-limit (429) propagate immediately |
 
 ### CLI Commands
 | Command | Description |
 |---------|-------------|
-| `utxo-tracer trace-utxo` | Full single-UTXO trace engine with all options |
-| `utxo-tracer trace-address` | Trace all addresses that interact with a given address |
+| `utxo-tracer trace-utxo` | Trace a single UTXO backwards/forwards through the chain. Follows the cash flow from a UTXO input or spend. |
+| `utxo-tracer trace-address` | Trace all addresses that have interacted with a given Cardano address. Builds an interaction graph of all counterparties. |
 | `utxo-tracer health` | Check provider connectivity (single or fallback chain) |
 | `utxo-tracer assets` | Show asset breakdown for a single UTXO (ADA, native assets, datum, script ref) |
 | `utxo-tracer config set` | Save provider credentials persistently to `~/.utxo-tracer/config.json` |
@@ -235,9 +246,11 @@ export MAESTRO_BASE_URL=https://mainnet.gomaestro-api.org/v1
 export UTXORPC_API_KEY=your_key
 export UTXORPC_BASE_URL=mainnet.utxorpc.com
 
-# Kupmios (local node)
+# Kupmios (local Kupo)
 export KUPO_URL=http://localhost:1442
-export OGMIOS_URL=http://localhost:1337
+
+# minibf (local Dolos mini-Blockfrost)
+export MINIBF_BASE_URL=http://localhost:50053
 ```
 
 A `.env` file is auto-discovered from the current working directory, parent directories, and `~/.utxo-tracer/.env`.
@@ -258,15 +271,17 @@ utxo-tracer trace-utxo abc123def456...#0 \
     --api-key mainnet_XXX \
     --max-depth 10
 
-# Forward trace (requires kupmios)
+# Forward trace (kupmios / blockfrost / koios / minibf)
 utxo-tracer trace-utxo abc123def456...#0 \
     --provider kupmios \
+    --kupo-url http://localhost:1442 \
     --direction forward \
     --max-depth 10
 
 # Trace backward AND forward from the same UTXO
+# (use a backward-capable provider; kupmios alone can't trace backward)
 utxo-tracer trace-utxo abc123def456...#0 \
-    --provider kupmios \
+    --provider minibf \
     --direction both
 ```
 
@@ -299,6 +314,29 @@ UTXO format:   <tx_hash>#<output_index>
   --cex-file     JSON file with exchange address registry
   --depth-report Show node count per depth level
   --no-cache     Skip local cache, always query providers
+```
+
+### Trace an Address
+
+Unlike `trace-utxo` (which follows a single UTXO chain), `trace-address` examines **all transactions** involving a given address and builds an interaction graph showing every counterparty and the flow of funds between them.
+
+```bash
+# Basic address trace (depth 1 = direct interactions only)
+utxo-tracer trace-address addr1...
+
+# Trace deeper — see who interactors also interact with
+utxo-tracer trace-address addr1... --max-depth 2 --tx-limit 50
+
+# Filter to only CEX-reaching branches
+utxo-tracer trace-address addr1... --max-depth 3 --cex-filter
+
+# Limit transactions per address level for large addresses
+utxo-tracer trace-address addr1... --tx-limit 100
+
+# Control flow direction
+utxo-tracer trace-address addr1... --direction backward    # upstream: who sent to it
+utxo-tracer trace-address addr1... --direction forward     # downstream: who received from it
+utxo-tracer trace-address addr1... --direction both        # all interactions (default)
 ```
 
 ### Other commands
@@ -347,17 +385,21 @@ Or as a list:
 ### Fallback chain
 
 By default, fallback is enabled. If the primary provider fails, the tool tries:
-`primary → blockfrost → koios → maestro → utxorpc`
-(kupmios and minibf are excluded from auto-fallback — they require explicit local URLs.)
+`primary → utxorpc → minibf → koios → blockfrost → maestro`
+(kupmios is excluded from auto-fallback; minibf joins the chain only when its
+base URL is configured. For backward traces, providers that can't resolve tx
+inputs — e.g. kupmios — are skipped.)
 
 Transient errors (timeouts, connection failures) are retried with exponential backoff (0.5s, 1s, 2s). Non-transient errors propagate immediately.
 
 ### UTxORPC
 
-High-throughput gRPC provider. **Backward tracing only** — forward depends on
-`DumpHistory`, which many endpoints (e.g. Demeter.run) do not expose. Can be
-self-hosted (Dolos) or used via Demeter.run. The URL scheme selects the
-transport: `https://` → TLS, `http://` → plaintext.
+High-throughput gRPC provider. **Backward + address** — backward tracing fetches
+a transaction's inputs and outputs in one `ReadTx` call (works for spent outputs,
+unlike a UTXO-set query). Forward tracing depends on `DumpHistory`, which many
+endpoints (e.g. Demeter.run) do not expose. Can be self-hosted (Dolos) or used
+via Demeter.run. The URL scheme selects the transport: `https://` → TLS,
+`http://` → plaintext.
 
 ```bash
 # Demeter.run (TLS) — gRPC endpoint + key
@@ -370,41 +412,70 @@ utxo-tracer trace-utxo abc123...#0 --provider utxorpc \
     --endpoint-url http://localhost:50051
 ```
 
-### Kupmios (local node)
+### Kupmios (local Kupo)
 
-The only provider that supports native forward tracing. Requires a running [Kupo](https://github.com/cardanosolutions/kupo) and [Ogmios](https://ogmios.dev) instance.
+Forward + address tracing against a running [Kupo](https://github.com/cardanosolutions/kupo)
+instance. **No Ogmios** — Kupo's `?spent` filter and `spent_at` metadata give a
+UTXO-precise forward spend map on their own. **No backward tracing**: Kupo indexes
+outputs/UTXOs but cannot list a transaction's inputs, so backward traces must use
+another provider.
 
 ```bash
 utxo-tracer trace-utxo abc123...#0 \
     --provider kupmios \
     --kupo-url http://localhost:1442 \
-    --ogmios-url http://localhost:1337 \
     --direction forward
+```
+
+Multiple Kupo instances can be rotated by comma-separating `--kupo-url`.
+
+### minibf (Dolos)
+
+Dolos's Blockfrost-compatible REST subset. **Backward + forward + address**, all
+via standard Blockfrost routes served at the root path (no `/api/v0` prefix),
+usually without auth.
+
+```bash
+utxo-tracer trace-utxo abc123...#0 \
+    --provider minibf \
+    --base-url http://localhost:50053 \
+    --direction both
 ```
 
 ---
 
 ## Tracing modes
 
-### Backward tracing (default)
+The tool supports two fundamentally different kinds of traces:
+
+| Kind | Command | Scope | Use case |
+|------|---------|-------|----------|
+| **UTXO trace** | `trace-utxo` | Follows a **single UTXO** backward through its inputs or forward through spends. | "Where did this specific transaction output come from / go to?" |
+| **Address trace** | `trace-address` | Follows **all addresses** that shared a transaction with a target address — builds an interaction graph. | "Who does this address interact with?" |
+
+---
+
+### UTXO tracing (trace-utxo)
+
+#### Backward tracing (default)
 
 Walks backward from the starting UTXO through transaction inputs. For each UTXO, fetches the transaction that created it, finds all input UTXOs consumed by that transaction, and continues recursively.
 
 Use case: find where funds **came from** — trace back to a CEX withdrawal, mining reward, or initial distribution.
 
-### Forward tracing
+#### Forward tracing
 
 Walks forward from the starting UTXO through spent outputs. For each UTXO's address, finds transactions that spent outputs going to that address, and follows their output UTXOs.
 
 Use case: find where funds **went** — trace through a hacker's wallet chain to a CEX deposit.
 
-### Both directions
+#### Both directions
 
 Runs backward first, then forward from the same starting UTXO. The graph shows both cash-in (backward) and cash-out (forward) edges in different colors.
 
-### Diamond pattern handling
+#### Diamond pattern handling
 
-Both tracing engines use **edge-based deduplication** rather than node-based. This preserves all branches of diamond-shaped transaction patterns:
+Both UTXO tracing engines use **edge-based deduplication** rather than node-based. This preserves all branches of diamond-shaped transaction patterns:
 
 ```
      X
@@ -413,6 +484,29 @@ Both tracing engines use **edge-based deduplication** rather than node-based. Th
     \ /
      Y
 ```
+
+### Address tracing (trace-address)
+
+`trace-address` is an entirely different mode from UTXO tracing. Instead of following a single UTXO chain, it:
+
+1. **Fetches all transactions** involving the target address (up to `--tx-limit` per level)
+2. **Extracts all counterparty addresses** from those transactions (senders and receivers)
+3. **Recurses** on each new address up to `--max-depth` (default 1 = direct interactors only)
+4. **Builds a directed interaction graph** showing who sent funds to whom and how much
+
+Unlike UTXO tracing where every node is a single UTXO, address tracing nodes are **addresses** and edges represent the net ADA flow between them across all shared transactions.
+
+```bash
+utxo-tracer trace-address addr1...                     # direct interactors
+utxo-tracer trace-address addr1... --max-depth 2        # interactors-of-interactors
+utxo-tracer trace-address addr1... --cex-filter         # only CEX-touching branches
+utxo-tracer trace-address addr1... --direction forward  # only downstream flow
+```
+
+The `--direction` flag controls which side of the address's transactions to include:
+- **backward** — only addresses that **sent** funds to the target (upstream)
+- **forward** — only addresses that **received** from the target (downstream)
+- **both** — all counterparties (default)
 
 ---
 
@@ -532,7 +626,7 @@ src/utxo_tracer/
 │   ├── koios.py               # Koios REST API
 │   ├── maestro.py             # Maestro REST API
 │   ├── utxorpc.py             # UTxORPC gRPC (python-sdk)
-│   ├── kupmios.py             # Kupo + Ogmios (local node)
+│   ├── kupmios.py             # Kupo (local node, forward + address)
 │   └── fallback.py            # Multi-provider fallback with retries
 ├── tracing/
 │   ├── __init__.py            # build_graph_from_steps()

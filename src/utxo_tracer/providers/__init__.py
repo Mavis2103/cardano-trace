@@ -123,29 +123,20 @@ def build_provider(
 
     if name == "kupmios":
         raw_kupo = merged("kupo_url") or "http://localhost:1442"
-        raw_ogmios = merged("ogmios_url") or "http://localhost:1337"
         kupo_urls = split_api_keys(raw_kupo)
-        ogmios_urls = split_api_keys(raw_ogmios)
         kupo_api_keys = split_api_keys(merged("kupo_api_key") or "")
-        ogmios_api_keys = split_api_keys(merged("ogmios_api_key") or "")
 
-        # Zip or pad: pair kupo_url[i] ↔ ogmios_url[i] ↔ kupo_api_key[i] ↔ ogmios_api_key[i]
-        n = max(len(kupo_urls), len(ogmios_urls), len(kupo_api_keys), len(ogmios_api_keys), 1)
+        # Pad api_keys to match the number of Kupo URLs (multi-instance rotation).
+        n = max(len(kupo_urls), len(kupo_api_keys), 1)
         while len(kupo_urls) < n:
             kupo_urls.append(kupo_urls[0])
-        while len(ogmios_urls) < n:
-            ogmios_urls.append(ogmios_urls[0])
         while len(kupo_api_keys) < n:
             kupo_api_keys.append(kupo_api_keys[0] if kupo_api_keys else "")
-        while len(ogmios_api_keys) < n:
-            ogmios_api_keys.append(ogmios_api_keys[0] if ogmios_api_keys else "")
 
         if n <= 1:
             return KupmiosProvider(
                 kupo_url=kupo_urls[0],
-                ogmios_url=ogmios_urls[0],
                 kupo_api_key=kupo_api_keys[0],
-                ogmios_api_key=ogmios_api_keys[0],
             )
 
         instances: list[tuple[str, Provider]] = []
@@ -154,9 +145,7 @@ def build_provider(
                 f"kupo-{i}",
                 KupmiosProvider(
                     kupo_url=kupo_urls[i],
-                    ogmios_url=ogmios_urls[i],
                     kupo_api_key=kupo_api_keys[i],
-                    ogmios_api_key=ogmios_api_keys[i],
                 ),
             ))
         _LOGGER.info(

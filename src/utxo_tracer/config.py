@@ -17,8 +17,6 @@ Supported env vars:
   MINIBF_BASE_URL
   KUPO_URL
   KUPO_API_KEY
-  OGMIOS_URL
-  OGMIOS_API_KEY
   UTXORPC_API_KEY               UTxORPC API key (optional)
   UTXORPC_BASE_URL              UTxORPC base URL
   UTXORPC_ENDPOINT_URL          UTxORPC endpoint URL (Demeter/self-hosted)
@@ -101,7 +99,7 @@ _ENV_OVERRIDE_VARS = [
     "KOIOS_API_KEY", "KOIOS_BASE_URL",
     "MAESTRO_API_KEY", "MAESTRO_BASE_URL",
     "MINIBF_API_KEY", "MINIBF_AUTH_TYPE", "MINIBF_BASE_URL",
-    "KUPO_URL", "KUPO_API_KEY", "OGMIOS_URL", "OGMIOS_API_KEY",
+    "KUPO_URL", "KUPO_API_KEY",
     # CEX env vars
     "BINANCE_API_KEY", "BINANCE_API_SECRET",
     "BYBIT_API_KEY", "BYBIT_API_SECRET",
@@ -156,8 +154,6 @@ def _env_overlay(base: dict[str, Any]) -> dict[str, Any]:
     _set(["providers", "utxorpc", "endpoint_url"], os.getenv("UTXORPC_ENDPOINT_URL"))
     _set(["providers", "kupmios", "kupo_url"], os.getenv("KUPO_URL"))
     _set(["providers", "kupmios", "kupo_api_key"], os.getenv("KUPO_API_KEY"))
-    _set(["providers", "kupmios", "ogmios_url"], os.getenv("OGMIOS_URL"))
-    _set(["providers", "kupmios", "ogmios_api_key"], os.getenv("OGMIOS_API_KEY"))
     # CEX env vars
     _set(["cex", "binance", "api_key"], os.getenv("BINANCE_API_KEY"))
     _set(["cex", "binance", "api_secret"], os.getenv("BINANCE_API_SECRET"))
@@ -196,9 +192,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "kupmios": {
             "kupo_url": None,
-            "ogmios_url": None,
             "kupo_api_key": None,
-            "ogmios_api_key": None,
         },
     },
     "defaults": {
@@ -259,9 +253,7 @@ def set_provider_config(
     auth_type: str | None = None,
     endpoint_url: str | None = None,
     kupo_url: str | None = None,
-    ogmios_url: str | None = None,
     kupo_api_key: str | None = None,
-    ogmios_api_key: str | None = None,
     make_default: bool = True,
 ) -> dict[str, Any]:
     # Load raw config.json WITHOUT env overlay to avoid saving env values
@@ -284,9 +276,7 @@ def set_provider_config(
         "auth_type": auth_type,
         "endpoint_url": endpoint_url,
         "kupo_url": kupo_url,
-        "ogmios_url": ogmios_url,
         "kupo_api_key": kupo_api_key,
-        "ogmios_api_key": ogmios_api_key,
     }
     for key, val in updates.items():
         if val is not None:

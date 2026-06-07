@@ -25,6 +25,12 @@ class Provider(ABC):
     # capability of what they wrap instead of being wrongly excluded.
     supports_forward: bool = False
 
+    # True for providers that can resolve a transaction's INPUTS from its hash
+    # (backward tracing). Kupo-only providers set this False: Kupo indexes
+    # outputs/UTXOs and has no query for "UTXOs consumed by tx X", so backward
+    # tracing must use a provider that exposes tx inputs directly.
+    supports_backward: bool = True
+
     @abstractmethod
     async def health_check(self) -> bool:
         """Return True if provider is reachable and authorized."""

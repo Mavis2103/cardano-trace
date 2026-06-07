@@ -46,7 +46,6 @@ CONNECTION_OPTS = {
     "--auth-type",
     "--endpoint-url",
     "--kupo-url",
-    "--ogmios-url",
     "--use-proxy",
     "--proxy-url",
 }

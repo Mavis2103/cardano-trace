@@ -63,6 +63,10 @@ FALLBACK_ORDER = ["utxorpc", "minibf", "koios", "blockfrost", "maestro"]
 # that URL is configured, so an unconfigured local node never adds a dead hop.
 _FALLBACK_REQUIRES_URL = {"minibf": "base_url", "kupmios": "kupo_url"}
 
+# Providers whose supports_backward is False — can't resolve a tx's inputs, so
+# they're skipped for backward traces (see KupmiosProvider.supports_backward).
+_BACKWARD_INCAPABLE = {"kupmios"}
+
 
 def _fatal(msg: str, exit_code: int = 1) -> NoReturn:
     err_console.print(f"[bold red]Error:[/bold red] {msg}")
@@ -129,12 +133,6 @@ def connection_options(func):
             "--kupo-url", type=str, default=None, help="Kupo URL(s) for kupmios (comma-separate)."
         ),
         click.option(
-            "--ogmios-url",
-            type=str,
-            default=None,
-            help="Ogmios URL(s) for kupmios (comma-separate).",
-        ),
-        click.option(
             "--use-proxy/--no-proxy", default=False, help="Route HTTP providers through a proxy."
         ),
         click.option(
@@ -156,7 +154,6 @@ def _collect_overrides(
     auth_type: Optional[str] = None,
     endpoint_url: Optional[str] = None,
     kupo_url: Optional[str] = None,
-    ogmios_url: Optional[str] = None,
 ) -> dict:
     """Build a provider-override dict from CLI flags, dropping unset (None) values."""
     return {
@@ -167,7 +164,6 @@ def _collect_overrides(
             "auth_type": auth_type,
             "endpoint_url": endpoint_url,
             "kupo_url": kupo_url,
-            "ogmios_url": ogmios_url,
         }.items()
         if v is not None
     }
@@ -196,9 +192,9 @@ def _build_providers(
     auth_type: Optional[str],
     endpoint_url: Optional[str],
     kupo_url: Optional[str],
-    ogmios_url: Optional[str],
     use_proxy: bool,
     proxy_url: str,
+    need_backward: bool = False,
 ) -> Provider:
     provider_cfg = (cfg.get("providers") or {}).get(name, {}) or {}
     overrides = _collect_overrides(
@@ -207,10 +203,14 @@ def _build_providers(
         auth_type=auth_type,
         endpoint_url=endpoint_url,
         kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
     )
 
     if not use_fallback:
+        if need_backward and name in _BACKWARD_INCAPABLE:
+            _fatal(
+                f"Provider '{name}' cannot trace backward (Kupo has no tx-input "
+                f"query). Use utxorpc/blockfrost/koios/minibf, or enable --fallback."
+            )
         return build_provider(
             name,
             provider_cfg,
@@ -234,6 +234,16 @@ def _build_providers(
             logging.getLogger(__name__).debug(
                 "Skipping %s in fallback chain: no %s configured", pname, req
             )
+            continue
+        # For backward traces, drop providers that can't resolve tx inputs
+        # (Kupo). Done even for the chosen primary, so the chain falls through
+        # to a backward-capable provider instead of dead-ending on empty inputs.
+        if need_backward and pname in _BACKWARD_INCAPABLE:
+            if pname == name:
+                console.print(
+                    f"[yellow]'{pname}' can't trace backward — using fallback "
+                    f"providers for tx inputs[/yellow]"
+                )
             continue
         try:
             p = build_provider(
@@ -757,8 +767,9 @@ PROVIDERS
   blockfrost   Blockfrost API (mainnet/testnet). Backward + forward + address.
   koios        Koios public API. Backward + forward + address.
   maestro      Maestro API. Backward + address (no forward).
-  kupmios      Kupo + Ogmios (self-hosted). Backward + forward + address.
-  utxorpc      UTxORPC gRPC. Backward only (forward depends on DumpHistory).
+  minibf       Dolos mini-Blockfrost (self-hosted). Backward + forward + address.
+  kupmios      Kupo (self-hosted). Forward + address only (no backward).
+  utxorpc      UTxORPC gRPC. Backward + address (forward depends on DumpHistory).
 
   Backward = trace UTXO inputs (cash-in side).
   Forward  = trace UTXO spends (cash-out side).
@@ -767,12 +778,14 @@ PROVIDERS
 MULTI-KEY (rate-limit avoidance)
   Pass multiple API keys comma-separated: --api-key key1,key2,key3
   Auto-rotates on HTTP 429. Supported for: blockfrost, koios, maestro.
-  Kupmios also supports comma-separated --kupo-url / --ogmios-url
-    for multi-instance rotation (e.g. multiple Kupo+Ogmios pairs).
+  Kupmios also supports comma-separated --kupo-url
+    for multi-instance rotation (e.g. multiple Kupo instances).
   UTxORPC rate-limit depends on endpoint (Demeter.run, self-hosted, etc.).
 
 FALLBACK
-  --fallback (on)   tries primary, then utxorpc -> blockfrost -> koios -> maestro
+  --fallback (on)   tries primary, then utxorpc -> minibf -> koios -> blockfrost
+                    -> maestro (minibf only if its base URL is configured;
+                    kupmios excluded; backward skips inputs-incapable providers)
   --no-fallback     single provider only
 
 CONFIG PRIORITY  CLI flags > shell env > .env file > config.json
@@ -819,7 +832,6 @@ def trace_cmd(
     auth_type,
     endpoint_url,
     kupo_url,
-    ogmios_url,
     direction,
     max_depth,
     output,
@@ -913,9 +925,9 @@ def trace_cmd(
         auth_type=auth_type,
         endpoint_url=endpoint_url,
         kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
         use_proxy=use_proxy,
         proxy_url=proxy_url,
+        need_backward=direction in ("backward", "both"),
     )
     # Gate forward tracing on the real provider CAPABILITY (the single source
     # of truth shared with the tracer in tracing/forward.py), not a hardcoded
@@ -1077,7 +1089,6 @@ def trace_address_cmd(
     auth_type,
     endpoint_url,
     kupo_url,
-    ogmios_url,
     tx_limit,
     max_depth,
     direction,
@@ -1204,7 +1215,6 @@ def trace_address_cmd(
         auth_type=auth_type,
         endpoint_url=endpoint_url,
         kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
         use_proxy=use_proxy,
         proxy_url=proxy_url,
     )
@@ -1728,9 +1738,7 @@ def config_group() -> None:
 @click.option("--auth-type", type=click.Choice(AUTH_TYPE_CHOICES), default=None)
 @click.option("--endpoint-url", type=str, default=None)
 @click.option("--kupo-url", type=str, default=None)
-@click.option("--ogmios-url", type=str, default=None)
 @click.option("--kupo-api-key", type=str, default=None)
-@click.option("--ogmios-api-key", type=str, default=None)
 @click.option("--make-default/--no-default", default=True)
 def config_set(
     provider,
@@ -1739,9 +1747,7 @@ def config_set(
     auth_type,
     endpoint_url,
     kupo_url,
-    ogmios_url,
     kupo_api_key,
-    ogmios_api_key,
     make_default,
 ):
     cfg = set_provider_config(
@@ -1751,9 +1757,7 @@ def config_set(
         auth_type=auth_type,
         endpoint_url=endpoint_url,
         kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
         kupo_api_key=kupo_api_key,
-        ogmios_api_key=ogmios_api_key,
         make_default=make_default,
     )
     console.print(f"[green]Saved config for provider '{provider}'.[/green]")
@@ -1799,7 +1803,6 @@ def health_cmd(
     auth_type,
     endpoint_url,
     kupo_url,
-    ogmios_url,
     fallback,
     use_proxy,
     proxy_url,
@@ -1811,7 +1814,6 @@ def health_cmd(
         auth_type=auth_type,
         endpoint_url=endpoint_url,
         kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
     )
 
     if provider:
@@ -1828,8 +1830,7 @@ def health_cmd(
             auth_type=auth_type,
             endpoint_url=endpoint_url,
             kupo_url=kupo_url,
-            ogmios_url=ogmios_url,
-            use_proxy=use_proxy,
+                use_proxy=use_proxy,
             proxy_url=proxy_url,
         )
 
@@ -2063,7 +2064,6 @@ def assets_cmd(
     auth_type,
     endpoint_url,
     kupo_url,
-    ogmios_url,
     use_proxy,
     proxy_url,
 ):
@@ -2080,7 +2080,6 @@ def assets_cmd(
         auth_type=auth_type,
         endpoint_url=endpoint_url,
         kupo_url=kupo_url,
-        ogmios_url=ogmios_url,
     )
     prov = build_provider(
         provider_name,

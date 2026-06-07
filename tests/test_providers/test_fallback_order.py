@@ -14,7 +14,7 @@ from utxo_tracer.cli import FALLBACK_ORDER, _build_providers
 def _chain(name, cfg):
     p = _build_providers(
         name, cfg, use_fallback=True, api_key=None, base_url=None, auth_type=None,
-        endpoint_url=None, kupo_url=None, ogmios_url=None, use_proxy=False,
+        endpoint_url=None, kupo_url=None, use_proxy=False,
         proxy_url="http://localhost:3001",
     )
     names = list(getattr(p, "_names", []))

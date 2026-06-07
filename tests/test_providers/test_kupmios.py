@@ -1,4 +1,4 @@
-"""Unit tests for Kupmios provider (Kupo + Ogmios)."""
+"""Unit tests for the Kupo provider (provider_type "kupmios", Kupo-only)."""
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -26,20 +26,6 @@ def _mock_kupo_client():
     return client
 
 
-def _mock_ogmios_client():
-    """Create a mock httpx.AsyncClient for Ogmios."""
-    client = AsyncMock(spec=httpx.AsyncClient)
-    fake = MagicMock()
-    fake.status_code = 404
-    fake.json.return_value = {}
-
-    async def _default(*args, **kwargs):
-        return fake
-    client.get.side_effect = _default
-    client.post.side_effect = _default
-    return client
-
-
 def _make_get_response(status_code: int = 200, json_data=None):
     """Return async function producing a fake httpx.Response for .get()."""
     resp = MagicMock()
@@ -53,21 +39,6 @@ def _make_get_response(status_code: int = 200, json_data=None):
             )
         return resp
     return _get
-
-
-def _make_post_response(status_code: int = 200, json_data=None):
-    """Return async function producing a fake httpx.Response for .post()."""
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.json.return_value = json_data if json_data is not None else {}
-
-    async def _post(*args, **kwargs):
-        if status_code >= 400:
-            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-                "Error", request=MagicMock(), response=resp
-            )
-        return resp
-    return _post
 
 
 def _kupo_match(tx_id: str, output_index: int, address: str,
@@ -91,9 +62,7 @@ async def test_health_check_kupo_ok():
     """Health returns True when Kupo /health returns 200."""
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
-    provider._ogmios = _mock_ogmios_client()
     provider._kupo.get.side_effect = _make_get_response(200, {})
-    provider._ogmios.get.side_effect = _make_get_response(200, {})
     result = await provider.health_check()
     assert result is True
 
@@ -103,30 +72,22 @@ async def test_health_check_kupo_fail():
     """Health returns False when Kupo is down."""
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
-    provider._ogmios = _mock_ogmios_client()
 
     async def _kupo_raise(*args, **kwargs):
         raise httpx.ConnectError("Kupo down")
     provider._kupo.get.side_effect = _kupo_raise
-    provider._ogmios.get.side_effect = _make_get_response(200, {})
     result = await provider.health_check()
     assert result is False
 
 
 @pytest.mark.asyncio
-async def test_health_check_ogmios_separate():
-    """Health is True even when Ogmios is down (only Kupo needed)."""
+async def test_health_check_is_kupo_only():
+    """Provider has no Ogmios dependency — health is driven solely by Kupo,
+    and the provider declares it cannot trace backward."""
     provider = KupmiosProvider()
-    provider._kupo = _mock_kupo_client()
-    provider._ogmios = _mock_ogmios_client()
-    provider._kupo.get.side_effect = _make_get_response(200, {})
-
-    async def _ogmios_raise(*args, **kwargs):
-        raise httpx.ConnectError("Ogmios down")
-    provider._ogmios.get.side_effect = _ogmios_raise
-    result = await provider.health_check()
-    assert result is True
-    assert provider._ogmios_ok is False
+    assert not hasattr(provider, "_ogmios")
+    assert provider.supports_backward is False
+    assert provider.supports_forward is True
 
 
 # ── get_utxo_by_out_ref ──────────────────────────────────────────────────────
@@ -148,7 +109,6 @@ async def test_get_utxo_by_out_ref():
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
     provider._kupo.get.side_effect = _make_get_response(200, [match])
-    provider._ogmios = _mock_ogmios_client()
 
     result = await provider.get_utxo_by_out_ref(out_ref)
     assert result is not None
@@ -167,7 +127,6 @@ async def test_get_utxo_by_out_ref_404():
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
     provider._kupo.get.side_effect = _make_get_response(404, [])
-    provider._ogmios = _mock_ogmios_client()
 
     result = await provider.get_utxo_by_out_ref(out_ref)
     assert result is None
@@ -177,79 +136,70 @@ async def test_get_utxo_by_out_ref_404():
 
 @pytest.mark.asyncio
 async def test_get_transaction_utxos():
-    """Returns inputs (from Ogmios) and outputs (from Kupo)."""
+    """Returns outputs from Kupo; inputs are always empty.
+
+    Kupo can't resolve a tx's inputs (no reverse query), so backward tracing is
+    unsupported and ``inputs`` is always ``[]``. Forward tracing uses only the
+    outputs.
+    """
     tx_hash = "aabbccdd00112233445566778899aabbccdd00112233445566778899aabb"
 
-    # Kupo outputs response
     kupo_outputs = [
-        _kupo_match(
-            tx_id=tx_hash,
-            output_index=1,
-            address="addr_output...",
-            coins=500000,
-        ),
+        _kupo_match(tx_id=tx_hash, output_index=0, address="addr_out0...", coins=500000),
+        _kupo_match(tx_id=tx_hash, output_index=1, address="addr_out1...", coins=700000),
     ]
-
-    # Ogmios inputs response (JSON-RPC)
-    ogmios_response = {
-        "jsonrpc": "2.0",
-        "result": [
-            {
-                "inputs": [
-                    {
-                        "transaction": {"id": "inpt1111111111111111111111111111111111111111111111111111111111"},
-                        "index": 0,
-                    },
-                ],
-            },
-        ],
-    }
 
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
     provider._kupo.get.side_effect = _make_get_response(200, kupo_outputs)
-    provider._ogmios = _mock_ogmios_client()
-    provider._ogmios.post.side_effect = _make_post_response(200, ogmios_response)
 
     result = await provider.get_transaction_utxos(tx_hash)
-    assert "inputs" in result
-    assert "outputs" in result
-    assert len(result["inputs"]) == 1
-    assert len(result["outputs"]) == 1
-    assert result["inputs"][0].tx_hash == "inpt1111111111111111111111111111111111111111111111111111111111"
+    assert result["inputs"] == []
+    assert len(result["outputs"]) == 2
 
 
 # ── get_address_transactions ─────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_get_address_transactions():
-    """Returns tx hashes from Kupo match created_at + spent_at."""
+    """Collects both the creating tx (top-level transaction_id) and the
+    spending tx (spent_at.transaction_id).
+
+    Kupo's ``created_at`` carries only {slot_no, header_hash} — NOT a
+    transaction_id — so the creating tx (address received funds) must come from
+    the match's top-level ``transaction_id`` field, not created_at.
+    """
     kupo_data = [
         {
-            "transaction_id": "created00000000000000000000000000000000000000000000000000000000001",
+            # received-only UTXO: creating tx in top-level transaction_id, unspent
+            "transaction_id": "txaaaa0000000000000000000000000000000000000000000000000000001",
             "output_index": 0,
             "address": "addr_test...",
             "value": {"coins": 1000000, "assets": {}},
-            "created_at": {"transaction_id": "txaaaa0000000000000000000000000000000000000000000000000000001"},
+            "created_at": {"slot_no": 100, "header_hash": "aa"},
         },
         {
-            "transaction_id": "spent000000000000000000000000000000000000000000000000000000000002",
+            # created by txbbbb, later spent by txcccc
+            "transaction_id": "txbbbb0000000000000000000000000000000000000000000000000000002",
             "output_index": 1,
             "address": "addr_test...",
             "value": {"coins": 2000000, "assets": {}},
-            "spent_at": {"transaction_id": "txbbbb0000000000000000000000000000000000000000000000000000002"},
+            "created_at": {"slot_no": 200, "header_hash": "bb"},
+            "spent_at": {"slot_no": 300, "header_hash": "cc",
+                         "transaction_id": "txcccc0000000000000000000000000000000000000000000000000000003"},
         },
     ]
 
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
     provider._kupo.get.side_effect = _make_get_response(200, kupo_data)
-    provider._ogmios = _mock_ogmios_client()
 
     result = await provider.get_address_transactions("addr_test...")
-    assert len(result) == 2
-    assert "txaaaa0000000000000000000000000000000000000000000000000000001" in result
-    assert "txbbbb0000000000000000000000000000000000000000000000000000002" in result
+    assert set(result) == {
+        "txaaaa0000000000000000000000000000000000000000000000000000001",  # created (received)
+        "txbbbb0000000000000000000000000000000000000000000000000000002",  # created (received)
+        "txcccc0000000000000000000000000000000000000000000000000000003",  # spent (sent)
+    }
 
 
 # ── get_address_spend_map ────────────────────────────────────────────────────
@@ -270,7 +220,6 @@ async def test_get_address_spend_map():
     provider = KupmiosProvider()
     provider._kupo = _mock_kupo_client()
     provider._kupo.get.side_effect = _make_get_response(200, kupo_data)
-    provider._ogmios = _mock_ogmios_client()
 
     result = await provider.get_address_spend_map("addr_test...")
     assert len(result) == 1
