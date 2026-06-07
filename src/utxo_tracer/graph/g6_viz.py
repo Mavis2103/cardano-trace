@@ -196,16 +196,58 @@ def build_utxo_payload(
             }
         )
 
-    edges = [
-        {
-            "source": e.source,
-            "target": e.target,
-            "direction": e.direction,
-            "tx_hash": e.tx_hash or "",
-            "width": 2.5,
-        }
-        for e in result.edges
-    ]
+    edges = []
+    for e in result.edges:
+        source_node = next((n for n in result.nodes if n.id == e.source), None)
+        amount = source_node.ada if source_node else 0
+
+        # Build multi-asset label components and detail data
+        asset_labels: list[str] = []
+        native_assets: list[dict] = []
+        if source_node:
+            for asset in source_node.assets:
+                if asset.is_lovelace:
+                    continue
+                aname = (
+                    asset.asset_name
+                    if len(asset.asset_name) <= 8
+                    else asset.asset_name[:6] + "…"
+                )
+                asset_labels.append(f"{asset.quantity:,} {aname}")
+                policy_display = (
+                    asset.policy_id[:16] + "…"
+                    if len(asset.policy_id) > 16
+                    else asset.policy_id
+                )
+                native_assets.append(
+                    {
+                        "name": asset.asset_name,
+                        "quantity": asset.quantity,
+                        "policy": policy_display,
+                    }
+                )
+
+        arrow = "→" if e.direction == "output" else "←"
+        if asset_labels:
+            assets_str = " + ".join(asset_labels[:2])
+            if len(asset_labels) > 2:
+                assets_str += f" +{len(asset_labels) - 2}"
+            edge_label = f"{arrow} {amount:.2f} ADA + {assets_str}"
+        else:
+            edge_label = f"{arrow} {amount:.2f} ADA"
+
+        edges.append(
+            {
+                "source": e.source,
+                "target": e.target,
+                "direction": e.direction,
+                "tx_hash": e.tx_hash or "",
+                "amount": amount,
+                "native_assets": native_assets,
+                "label": edge_label,
+                "width": 2.5,
+            }
+        )
 
     legend_addrs = [
         {
@@ -315,6 +357,14 @@ def build_address_payload(
 
     edges = []
     for e in result.edges:
+        source_node = next((n for n in result.addresses if n.address == e.source), None)
+        target_node = next((n for n in result.addresses if n.address == e.target), None)
+        net_ada = (
+            source_node.net_ada - target_node.net_ada
+            if (source_node and target_node)
+            else 0
+        )
+        edge_label = f"net {net_ada:+.2f} ADA ({e.interaction_count} tx)"
         edges.append(
             {
                 "source": e.source,
@@ -322,6 +372,8 @@ def build_address_payload(
                 "direction": e.direction_relative_to_target,
                 "interaction_count": e.interaction_count,
                 "tx_hashes": e.tx_hashes[:25],
+                "net_ada": net_ada,
+                "label": edge_label,
                 "width": min(8, 1.5 + e.interaction_count * 0.3),
             }
         )
@@ -515,6 +567,7 @@ _JS = r"""
     // colour (red=in/green=out) PLUS a non-colour cue (inbound = dashed) so the
     // graph stays readable for red/green colour-blind users.
     const isIn = e.direction === 'input' || e.direction === 'incoming';
+    const labelColor = isIn ? '#f85149' : '#3fb950';
     return {
       id: 'e' + i,
       source: e.source,
@@ -524,13 +577,21 @@ _JS = r"""
       // hub doesn't render as one solid bar of lines
       type: 'quadratic',
       style: {
-        stroke: isIn ? '#f85149' : '#3fb950',
+        stroke: labelColor,
         lineDash: isIn ? [6, 4] : [0],
         strokeOpacity: BIG ? 0.32 : 0.6,
         lineWidth: e.width || 2,
         endArrow: true,
         endArrowSize: BIG ? 5 : 8,
         curveOffset: 18,
+        // Edge label shows ADA amounts / transaction counts inline
+        labelText: e.label || '',
+        labelFontSize: BIG ? 8 : 10,
+        labelFill: labelColor,
+        labelBackground: true,
+        labelBackgroundFill: 'rgba(13,17,23,.8)',
+        labelBackgroundRadius: 3,
+        labelPlacement: 'middle',
       },
     };
   });
@@ -706,6 +767,32 @@ _JS = r"""
     }
     catch(err){ console.warn(err); }
   });
+  // ---- edge tooltip: show full transaction details on click ----
+  graph.on('edge:click', (e)=>{
+    try{
+      const edgeData = e.target;
+      const title = document.getElementById('dtitle');
+      const body = document.getElementById('dbody');
+      title.textContent = 'Transaction Edge';
+      let html = "<div class='kv'>";
+      html += "<b>From:</b> " + edgeData.source + "<br>";
+      html += "<b>To:</b> " + edgeData.target + "<br>";
+      if(edgeData.data.tx_hash) html += "<b>TX:</b> <code>" + edgeData.data.tx_hash + "</code><br>";
+      if(edgeData.data.amount != null) html += "<b>Amount:</b> " + edgeData.data.amount.toFixed(6) + " ADA<br>";
+      if(edgeData.data.interaction_count) html += "<b>Interactions:</b> " + edgeData.data.interaction_count + "<br>";
+      if(edgeData.data.net_ada != null && KIND === 'address') html += "<b>Net ADA:</b> " + edgeData.data.net_ada.toFixed(6) + " ADA<br>";
+      html += "<b>Direction:</b> " + edgeData.data.direction;
+      if(edgeData.data.native_assets && edgeData.data.native_assets.length > 0){
+        html += "<br><b>Native Assets:</b>";
+        for(const asset of edgeData.data.native_assets){
+          html += "<br>&nbsp;&nbsp;• " + asset.quantity.toLocaleString() + " " + asset.name + " (" + asset.policy + ")";
+        }
+      }
+      html += "</div>";
+      body.innerHTML = html;
+      detail.style.display = 'block';
+    } catch(err){ console.warn('edge click', err); }
+  });
   graph.on('canvas:click', ()=>{ detail.style.display='none'; clearHighlight(); });
 
   // ---- left panel: stats + type filter + legends ----
@@ -724,6 +811,12 @@ _JS = r"""
   if(KIND!=='utxo') html += "<div class='row'><span class='dot' style='background:#f0883e;box-shadow:0 0 5px #f0883e'></span>"+
     "<span>CEX user (direct counterparty)</span></div>";
   html += "<div class='row'><span class='muted'>solid = outflow · dashed = inflow</span></div>";
+  html += "<div class='sec' style='color:#58a6ff'>Knowledge Graph</div>";
+  html += "<div class='muted'>Nodes represent ";
+  html += KIND === 'utxo' ? "UTXOs (unspent transaction outputs)" : "Addresses (wallets/scripts)";
+  html += ". Edges represent transactions with semantic flow direction.</div>";
+  html += "<div class='row'><span class='muted'>Edge labels show ADA amounts transferred</span></div>";
+  html += "<div class='row'><span class='muted'>Click an edge for full transaction details</span></div>";
   html += "<div class='sec'>Type filter</div><div id='types'>";
   TYPES.forEach(t=>{ html += "<label class='f'><input type='checkbox' checked value='"+t+
     "'><span class='badge' style='background:"+TYPE_COLOR[t]+"33;color:"+TYPE_COLOR[t]+

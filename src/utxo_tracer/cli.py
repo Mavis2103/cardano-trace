@@ -30,12 +30,27 @@ from rich.tree import Tree
 
 from .cex.registry import identify_cex, load_cex_from_file
 from .config import clear_config, load_config, save_config, set_provider_config
-from .models import Asset, OutRef, TraceResult, TraceStep, TransactionEdge, UTxONode
+from .models import (
+    AddressTraceResult,
+    Asset,
+    OutRef,
+    TraceResult,
+    TraceStep,
+    TransactionEdge,
+    UTxONode,
+)
 from .providers import build_provider
 from .providers.base import Provider
 from .providers.fallback import FallbackProvider as _FallbackProvider
-from .tracing import apply_cex_filter, build_graph_from_steps, trace_backward, trace_forward
+from .tracing import (
+    apply_cex_filter,
+    build_graph_from_steps,
+    trace_backward,
+    trace_forward,
+)
 from .utils import lovelace_to_ada, parse_out_ref, shorten
+
+from .graph.md_export import export_trace_markdown, export_address_trace_markdown
 
 from ._rich_tty import LiveProgress
 
@@ -119,7 +134,9 @@ def connection_options(func):
             default=None,
             help="Provider API key. Comma-separate several to rotate on 429.",
         ),
-        click.option("--base-url", type=str, default=None, help="Override provider base URL."),
+        click.option(
+            "--base-url", type=str, default=None, help="Override provider base URL."
+        ),
         click.option(
             "--auth-type",
             type=click.Choice(AUTH_TYPE_CHOICES),
@@ -127,13 +144,21 @@ def connection_options(func):
             help="Auth scheme for blockfrost/minibf.",
         ),
         click.option(
-            "--endpoint-url", type=str, default=None, help="Demeter/UTxORPC endpoint URL."
+            "--endpoint-url",
+            type=str,
+            default=None,
+            help="Demeter/UTxORPC endpoint URL.",
         ),
         click.option(
-            "--kupo-url", type=str, default=None, help="Kupo URL(s) for kupmios (comma-separate)."
+            "--kupo-url",
+            type=str,
+            default=None,
+            help="Kupo URL(s) for kupmios (comma-separate).",
         ),
         click.option(
-            "--use-proxy/--no-proxy", default=False, help="Route HTTP providers through a proxy."
+            "--use-proxy/--no-proxy",
+            default=False,
+            help="Route HTTP providers through a proxy.",
         ),
         click.option(
             "--proxy-url",
@@ -814,6 +839,7 @@ def main() -> None:
 @click.option("--output", type=click.Choice(["table", "json", "csv"]), default="table")
 @click.option("--export-json", type=click.Path(dir_okay=False), default=None)
 @click.option("--export-csv", type=click.Path(), default=None)
+@click.option("--export-md", type=click.Path(dir_okay=False), default=None)
 @click.option("--fallback/--no-fallback", default=True)
 @click.option("--cex-file", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.option("--depth-report", is_flag=True, default=False)
@@ -837,6 +863,7 @@ def trace_cmd(
     output,
     export_json,
     export_csv,
+    export_md,
     fallback,
     cex_file,
     depth_report,
@@ -879,6 +906,13 @@ def trace_cmd(
                         from .graph.g6_viz import start_server
 
                         ck = cache_mod._cache_key(start, direction, max_depth)
+                        md_dir = Path("traces") / ck
+                        md_path = md_dir / "trace.md"
+                        if not md_path.exists():
+                            export_trace_markdown(cached_result, str(md_path))
+                            console.print(
+                                f"[green]Generated trace report:[/green] {md_path}"
+                            )
                         start_server(cached_result, start_out_ref=start, cache_key=ck)
                         return
                     # No v2 snapshot (e.g. old manifest from interrupted trace) — rebuild
@@ -910,6 +944,13 @@ def trace_cmd(
                     from .graph.g6_viz import start_server
 
                     ck = cache_mod._cache_key(start, direction, max_depth)
+                    md_dir = Path("traces") / ck
+                    md_path = md_dir / "trace.md"
+                    if not md_path.exists():
+                        export_trace_markdown(cached_result, str(md_path))
+                        console.print(
+                            f"[green]Generated trace report:[/green] {md_path}"
+                        )
                     start_server(cached_result, start_out_ref=start, cache_key=ck)
                     return
 
@@ -951,6 +992,13 @@ def trace_cmd(
             cache_mod.save_trace(
                 result, start, direction, max_depth, provider=provider_name
             )
+        # Auto-generate markdown trace report
+        if not no_cache and trace_key:
+            md_dir = Path("traces") / trace_key
+            md_path = md_dir / "trace.md"
+            if not md_path.exists():
+                export_trace_markdown(result, str(md_path))
+                console.print(f"[green]Generated trace report:[/green] {md_path}")
     except RuntimeError as e:
         if "event loop" in str(e).lower():
             _fatal(
@@ -980,6 +1028,9 @@ def trace_cmd(
         n_path, e_path = _export_csv(result, export_csv)
         console.print(f"[green]Exported nodes CSV:[/green] {n_path}")
         console.print(f"[green]Exported edges CSV:[/green] {e_path}")
+    if export_md:
+        md_path = export_trace_markdown(result, export_md)
+        console.print(f"[green]Exported markdown:[/green] {md_path}")
     from .graph.g6_viz import start_server
 
     if dash:
@@ -1014,6 +1065,12 @@ def _present_cached_address_result(
     """
     console.print("[green]Loaded from local cache[/green]")
     result = cached
+    addr_key = cache_mod._addr_cache_key(address, direction=direction)
+    md_dir = Path("traces") / addr_key
+    md_path = md_dir / "address_trace.md"
+    if not md_path.exists():
+        export_address_trace_markdown(cached, str(md_path))
+        console.print(f"[green]Generated address trace report:[/green] {md_path}")
     if cex_filter and result.addresses:
         n_before = len(result.addresses)
         result = apply_cex_filter(result)
@@ -1064,6 +1121,7 @@ def _present_cached_address_result(
 @click.option("--output", type=click.Choice(["table", "json", "csv"]), default="table")
 @click.option("--export-json", type=click.Path(dir_okay=False), default=None)
 @click.option("--export-csv", type=click.Path(), default=None)
+@click.option("--export-md", type=click.Path(dir_okay=False), default=None)
 @click.option("--fallback/--no-fallback", default=True)
 @click.option("--cex-file", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.option(
@@ -1095,6 +1153,7 @@ def trace_address_cmd(
     output,
     export_json,
     export_csv,
+    export_md,
     fallback,
     cex_file,
     cex_filter,
@@ -1370,6 +1429,16 @@ def trace_address_cmd(
 
     try:
         result = asyncio.run(_runner())
+        # Auto-generate markdown trace report
+        if not no_cache:
+            addr_key = cache_mod._addr_cache_key(address, direction=direction)
+            md_dir = Path("traces") / addr_key
+            md_path = md_dir / "address_trace.md"
+            if not md_path.exists():
+                export_address_trace_markdown(result, str(md_path))
+                console.print(
+                    f"[green]Generated address trace report:[/green] {md_path}"
+                )
     except RuntimeError as e:
         if "event loop" in str(e).lower():
             _fatal(
@@ -1402,9 +1471,7 @@ def trace_address_cmd(
             )
             cache_mod.finalize_address_trace(address, max_depth, direction)
         else:
-            logger.info(
-                "Skipping v2 snapshot save (no edges) — keeping prior snapshot"
-            )
+            logger.info("Skipping v2 snapshot save (no edges) — keeping prior snapshot")
 
     if output == "json":
         click.echo(jsonlib.dumps(_dataclass_to_dict(result), indent=2, default=str))
@@ -1420,6 +1487,9 @@ def trace_address_cmd(
         console.print(f"[green]Exported JSON:[/green] {export_json}")
     if export_csv and output != "csv":
         _export_address_csv(result, export_csv)
+    if export_md:
+        md_path = export_address_trace_markdown(result, export_md)
+        console.print(f"[green]Exported markdown:[/green] {md_path}")
 
     if dash and result.addresses:
         from .graph.g6_viz import start_address_server
@@ -1439,8 +1509,6 @@ def trace_address_cmd(
 
 
 def _print_address_summary(result: AddressTraceResult) -> None:
-    from .models import AddressTraceResult
-
     n_cex = sum(1 for n in result.addresses if n.is_cex)
     n_cex_users = sum(1 for n in result.addresses if n.cex_user)
     net_flow = sum(n.net_ada for n in result.addresses)
@@ -1485,9 +1553,7 @@ def _print_cex_filter_banner(n_before: int, n_after: int) -> None:
     set, so this banner only needs the count delta.
     """
     if n_after == 0:
-        console.print(
-            "[yellow]CEX filter: kept 0 addresses (empty trace).[/yellow]"
-        )
+        console.print("[yellow]CEX filter: kept 0 addresses (empty trace).[/yellow]")
     elif n_after == 1:
         console.print(
             f"[yellow]CEX filter: kept 1/{n_before} address — only the "
@@ -1507,8 +1573,6 @@ def _print_cex_filter_banner(n_before: int, n_after: int) -> None:
 
 
 def _print_address_nodes_table(result: AddressTraceResult) -> None:
-    from .models import AddressTraceResult
-
     addrs = result.addresses
     n_total = len(addrs)
     SHOW_TOP = 100 if n_total <= 150 else 50
@@ -1596,8 +1660,6 @@ def _print_address_nodes_table(result: AddressTraceResult) -> None:
 
 
 def _print_address_interaction_edges(result: AddressTraceResult) -> None:
-    from .models import AddressTraceResult
-
     if not result.edges:
         return
     table = Table(
@@ -1638,7 +1700,6 @@ def _print_address_interaction_edges(result: AddressTraceResult) -> None:
 
 def _export_address_json(result: AddressTraceResult, path: str) -> None:
     import json as _json
-    from .models import AddressTraceResult
 
     payload = {
         "target_address": result.target_address,
@@ -1678,7 +1739,6 @@ def _export_address_json(result: AddressTraceResult, path: str) -> None:
 
 def _export_address_csv(result: AddressTraceResult, base_path: str) -> tuple[str, str]:
     import csv as _csvmodule
-    from .models import AddressTraceResult
 
     base = Path(base_path)
     if base.suffix.lower() == ".csv":
@@ -1830,7 +1890,7 @@ def health_cmd(
             auth_type=auth_type,
             endpoint_url=endpoint_url,
             kupo_url=kupo_url,
-                use_proxy=use_proxy,
+            use_proxy=use_proxy,
             proxy_url=proxy_url,
         )
 
