@@ -6,7 +6,7 @@
 | Direction | both |
 | Maximum Depth | 2 |
 | Provider | utxorpc |
-| Generated | 2026-06-07T15:22:12 |
+| Generated | 2026-06-07T18:15:16 |
 
 ## Summary
 | Metric | Value |

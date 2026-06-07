@@ -908,11 +908,10 @@ def trace_cmd(
                         ck = cache_mod._cache_key(start, direction, max_depth)
                         md_dir = Path("traces") / ck
                         md_path = md_dir / "trace.md"
-                        if not md_path.exists():
-                            export_trace_markdown(cached_result, str(md_path))
-                            console.print(
-                                f"[green]Generated trace report:[/green] {md_path}"
-                            )
+                        export_trace_markdown(cached_result, str(md_path))
+                        console.print(
+                            f"[green]Generated trace report:[/green] {md_path}"
+                        )
                         start_server(cached_result, start_out_ref=start, cache_key=ck)
                         return
                     # No v2 snapshot (e.g. old manifest from interrupted trace) — rebuild
@@ -946,11 +945,8 @@ def trace_cmd(
                     ck = cache_mod._cache_key(start, direction, max_depth)
                     md_dir = Path("traces") / ck
                     md_path = md_dir / "trace.md"
-                    if not md_path.exists():
-                        export_trace_markdown(cached_result, str(md_path))
-                        console.print(
-                            f"[green]Generated trace report:[/green] {md_path}"
-                        )
+                    export_trace_markdown(cached_result, str(md_path))
+                    console.print(f"[green]Generated trace report:[/green] {md_path}")
                     start_server(cached_result, start_out_ref=start, cache_key=ck)
                     return
 
@@ -996,9 +992,8 @@ def trace_cmd(
         if not no_cache and trace_key:
             md_dir = Path("traces") / trace_key
             md_path = md_dir / "trace.md"
-            if not md_path.exists():
-                export_trace_markdown(result, str(md_path))
-                console.print(f"[green]Generated trace report:[/green] {md_path}")
+            export_trace_markdown(result, str(md_path))
+            console.print(f"[green]Generated trace report:[/green] {md_path}")
     except RuntimeError as e:
         if "event loop" in str(e).lower():
             _fatal(
@@ -1434,11 +1429,8 @@ def trace_address_cmd(
             addr_key = cache_mod._addr_cache_key(address, direction=direction)
             md_dir = Path("traces") / addr_key
             md_path = md_dir / "address_trace.md"
-            if not md_path.exists():
-                export_address_trace_markdown(result, str(md_path))
-                console.print(
-                    f"[green]Generated address trace report:[/green] {md_path}"
-                )
+            export_address_trace_markdown(result, str(md_path))
+            console.print(f"[green]Generated address trace report:[/green] {md_path}")
     except RuntimeError as e:
         if "event loop" in str(e).lower():
             _fatal(

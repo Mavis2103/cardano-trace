@@ -1,15 +1,18 @@
-"""Self-contained AntV G6 (v5) graph visualization.
+"""Self-contained WebGL graph visualization (Sigma.js v3).
 
-Replaces the dash-cytoscape renderer. G6 runs a real client-side physics
-layout (d3-force / force-atlas2) plus hierarchical (dagre), radial and
-concentric layouts, so large traces render as a readable network instead of
-the overlapping mess the old Python-side Fruchterman-Reingold + ``preset``
-positions produced.
+Renders trace graphs with Sigma.js v3 (WebGL) + graphology +
+graphology-layout-forceatlas2, loaded as ES modules from a CDN. WebGL draws
+tens of thousands of nodes at interactive frame-rates with NO node cap and no
+clustering — every node is shown. The force-directed layout runs ONCE (chunked,
+behind a progress bar) and the resulting node positions are persisted to the
+SQLite cache via ``/viz-state``, so re-opening the same trace is instant.
 
-The whole UI is one static HTML page (G6 loaded from CDN) served by a tiny
-stdlib ``http.server``.  A ``/viz-state`` endpoint persists camera + node
-positions back into the SQLite cache, keeping parity with the old
-``save_viz_state``/``load_viz_state`` feature.
+Serving model — a tiny stdlib ``http.server`` exposes three routes:
+
+* ``/``          → small static HTML shell (no inlined data)
+* ``/data``      → the graph payload as JSON, fetched async by the client so
+                   multi-MB / 50k-node graphs never block HTML parsing
+* ``/viz-state`` → GET loads / POST saves camera + node positions in SQLite
 
 Public entry points keep the old signatures so ``cli.py`` is a drop-in swap:
 
@@ -35,8 +38,6 @@ from utxo_tracer.utils import AddressType, classify_address
 
 logger = logging.getLogger(__name__)
 
-# G6 v5 UMD bundle. Pinned to the 5.x line; exposes the global ``G6``.
-_G6_CDN = "https://unpkg.com/@antv/g6@5/dist/g6.min.js"
 
 # address-type → G6 node shape (G6 v5 built-in node types)
 _SHAPE = {
@@ -196,9 +197,13 @@ def build_utxo_payload(
             }
         )
 
+    # O(1) node lookup — a linear scan per edge here was O(E·N), the dominant
+    # cost when building payloads for large traces (tens of thousands of edges).
+    node_by_id = {n.id: n for n in result.nodes}
+
     edges = []
     for e in result.edges:
-        source_node = next((n for n in result.nodes if n.id == e.source), None)
+        source_node = node_by_id.get(e.source)
         amount = source_node.ada if source_node else 0
 
         # Build multi-asset label components and detail data
@@ -355,10 +360,14 @@ def build_address_payload(
             }
         )
 
+    # O(1) lookups — two linear scans per edge here was 2·O(E·N), the dominant
+    # cost when building large address-interaction payloads.
+    node_by_addr = {n.address: n for n in result.addresses}
+
     edges = []
     for e in result.edges:
-        source_node = next((n for n in result.addresses if n.address == e.source), None)
-        target_node = next((n for n in result.addresses if n.address == e.target), None)
+        source_node = node_by_addr.get(e.source)
+        target_node = node_by_addr.get(e.target)
         net_ada = (
             source_node.net_ada - target_node.net_ada
             if (source_node and target_node)
@@ -418,15 +427,17 @@ def build_address_payload(
 
 
 def _render_html(payload: dict) -> str:
-    data_json = json.dumps(payload, default=str)
-    head = (
+    # The graph payload is served separately from ``/data`` and fetched async by
+    # the client, so multi-MB / 50k-node traces don't bloat the HTML, block the
+    # parser, or get held twice in memory. The HTML shell stays tiny.
+    title = payload.get("title", "Trace")
+    return (
         "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{payload.get('title', 'Trace')}</title>"
-        f"<script src='{_G6_CDN}'></script>"
+        f"<title>{title}</title>"
         "<style>" + _CSS + "</style></head><body>"
+        + _BODY
+        + "<script>" + _JS + "</script></body></html>"
     )
-    boot = "<script>window.__PAYLOAD__=" + data_json + ";</script>"
-    return head + _BODY + boot + "<script>" + _JS + "</script></body></html>"
 
 
 _CSS = """
@@ -439,7 +450,7 @@ html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
   overflow:auto}
 #left{top:10px;left:10px;width:266px}
 #toolbar{top:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px;
-  align-items:center;padding:6px 10px}
+  align-items:center;padding:6px 10px;flex-wrap:wrap;max-width:60vw}
 #detail{top:10px;right:10px;width:320px;display:none}
 #detail h3{margin:0 0 8px;font-size:13px;color:#58a6ff}
 .close{float:right;cursor:pointer;color:#8b949e}
@@ -456,462 +467,368 @@ button{cursor:pointer}
 label.f{display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer}
 code{font-size:10px;color:#e6edf3}
 .muted{color:#8b949e;font-size:10px}
+#overlay{position:fixed;inset:0;z-index:50;display:flex;align-items:center;
+  justify-content:center;flex-direction:column;gap:12px;background:rgba(13,17,23,.92);
+  color:#c9d1d9;font-size:13px}
+#bar{width:240px;height:6px;background:#21262d;border-radius:4px;overflow:hidden}
+#barfill{height:100%;width:0;background:#58a6ff;transition:width .12s}
+#err{position:fixed;inset:0;z-index:60;display:none;align-items:center;
+  justify-content:center;color:#f85149;padding:30px;text-align:center;font-size:13px}
 """
 
 _BODY = """
 <div id='graph'></div>
+<div id='overlay'><div id='ostat'>loading graph engine…</div>
+  <div id='bar'><div id='barfill'></div></div>
+  <div class='muted' id='ocount'></div></div>
+<div id='err'></div>
 <div id='toolbar' class='panel'>
-  <span class='sec' style='margin:0'>Layout</span>
-  <select id='layout'>
-    <option value='d3-force'>force (network)</option>
-    <option value='force-atlas2'>force-atlas2</option>
-    <option value='antv-dagre'>dagre (flow →)</option>
-    <option value='radial'>radial</option>
-    <option value='concentric'>concentric</option>
-    <option value='circular'>circular</option>
-    <option value='grid'>grid</option>
-  </select>
   <input id='search' placeholder='search addr / hash' size='16'>
+  <button id='relayout'>re-layout</button>
   <button id='labels'>labels</button>
   <button id='fit'>fit</button>
   <button id='png'>PNG</button>
+  <button id='clear'>clear</button>
 </div>
 <div id='left' class='panel'></div>
 <div id='detail' class='panel'><span class='close' id='dclose'>✕</span>
   <h3 id='dtitle'>Details</h3><div id='dbody'></div></div>
 """
 
-# Static JS — NOT an f-string, so JS braces stay literal.
+# Static JS (NOT an f-string — JS braces stay literal). The renderer is
+# Sigma.js v3 (WebGL) + graphology + graphology-layout-forceatlas2, loaded as
+# ESM from esm.sh. WebGL keeps tens of thousands of nodes at interactive FPS;
+# the force layout runs ONCE (chunked, with a progress bar) and the resulting
+# positions are cached to SQLite via /viz-state, so re-opening a trace is
+# instant. There is no node cap and no clustering — every node is drawn.
 _JS = r"""
-(function(){
-  const P = window.__PAYLOAD__;
-  const TYPE_COLOR = {wallet:'#58a6ff',script:'#d29922',byron:'#bc8cff',
-                      stake:'#3fb950',unknown:'#8b949e'};
+(async function(){
+  const ESM = 'https://esm.sh/';
+  const $ = (id)=>document.getElementById(id);
+  function fatal(msg){
+    try{ $('overlay').style.display='none';
+      const e=$('err'); e.style.display='flex';
+      e.textContent='Visualization failed to load: '+msg+
+        '\n\n(The graph engine is loaded from esm.sh — check your network.)';
+    }catch(_){}
+  }
+  window.addEventListener('error', (ev)=>{ /* keep going; surfaced per-stage */ });
+
+  // ---- load engine (ESM) ----
+  let graphologyMod, fa2Mod, sigmaMod;
+  try {
+    [graphologyMod, fa2Mod, sigmaMod] = await Promise.all([
+      import(ESM+'graphology@0.25.4'),
+      import(ESM+'graphology-layout-forceatlas2@0.10.1'),
+      import(ESM+'sigma@3.0.0'),
+    ]);
+  } catch(err){ fatal('engine import: '+err.message); return; }
+  const Graph = graphologyMod.MultiDirectedGraph ||
+                (graphologyMod.default && graphologyMod.default.MultiDirectedGraph) ||
+                graphologyMod.default;
+  const FA2 = fa2Mod.default || fa2Mod;
+  const Sigma = sigmaMod.default || sigmaMod;
+  if(!Graph || !FA2 || !FA2.assign || !Sigma){ fatal('engine exports missing'); return; }
+
+  // ---- fetch payload (served separately so huge graphs don't block parse) ----
+  let P;
+  try { P = await (await fetch('/data')).json(); }
+  catch(err){ P = window.__PAYLOAD__; }
+  if(!P){ fatal('no graph data'); return; }
+
   const KIND = P.kind;
   const CACHE_KEY = (new URLSearchParams(location.search)).get('k') || P.cache_key || '';
-
-  // ---- scale tuning by graph size ----
-  // Large graphs need more repulsion + bigger link distance to spread out,
-  // and labels hidden by default so the network stays readable.
+  const TYPE_COLOR = {wallet:'#58a6ff',script:'#d29922',byron:'#bc8cff',
+                      stake:'#3fb950',unknown:'#8b949e'};
   const N = P.nodes.length;
-  const BIG = N > 120;
-  // labels shown only when sparse, or on hover/zoom-in (see LOD below)
-  let SHOW_LABELS = !BIG;
-  // force strengths grow with N so dense graphs don't collapse into a blob.
-  // Stronger repulsion + longer links + bigger collision padding keep large
-  // graphs from overlapping into an unreadable hairball.
-  const REPULSE = -(220 + 40 * Math.sqrt(N));
-  const LINKLEN = Math.min(560, 150 + 8 * Math.sqrt(N));
-  const COLLIDE_PAD = BIG ? 30 : 16;
+  const BIG = N > 400;
 
-  // collision radius per node so preventOverlap respects actual node size
-  const sizeById = {};
-  P.nodes.forEach(n => { sizeById[n.id] = n.size || 30; });
-
-  // ---- build G6 data ----
-  // root + CEX nodes keep their label on at all times (always_label) so the
-  // key landmarks stay readable when labels are toggled off / zoomed out.
-  function labelText(n){
-    return (SHOW_LABELS || n.always_label) ? (n.label || '') : '';
-  }
-  function labelStyle(n){
-    const on = n.always_label;
-    return {
-      labelText: labelText(n),
-      labelFill: on ? '#fff' : '#c9d1d9',
-      labelFontSize: on ? 11 : 9,
-      labelFontWeight: on ? 700 : 400,
-      labelBackground: true,
-      labelBackgroundFill: 'rgba(13,17,23,.7)',
-      labelBackgroundRadius: 3,
-      labelPlacement: 'bottom',
-      labelOffsetY: 3,
-    };
-  }
-  // gold glow/halo for the root wallet, red glow/halo for CEX nodes — a fill
-  // shadow stays visible at low zoom where a thin stroke disappears.
-  function haloStyle(n){
-    if(n.is_start) return {
-      halo: true, haloStroke: '#ffd700', haloStrokeWidth: 10, haloOpacity: 0.45,
-      shadowColor: '#ffd700', shadowBlur: 24,
-      badge: true, badges: [{text:'★', placement:'top-right',
-        backgroundFill:'#ffd700', fill:'#0d1117', fontSize:11}],
-    };
-    if(n.cex) return {
-      halo: true, haloStroke: '#f85149', haloStrokeWidth: 9, haloOpacity: 0.42,
-      shadowColor: '#f85149', shadowBlur: 20,
-      badge: true, badges: [{text:'CEX', placement:'top-right',
-        backgroundFill:'#f85149', fill:'#fff', fontSize:8}],
-    };
-    if(n.cex_user) return {
-      halo: true, haloStroke: '#f0883e', haloStrokeWidth: 6, haloOpacity: 0.34,
-      shadowColor: '#f0883e', shadowBlur: 12,
-      badge: true, badges: [{text:'USER', placement:'top-right',
-        backgroundFill:'#f0883e', fill:'#0d1117', fontSize:7}],
-    };
-    return {};
-  }
-  const nodes = P.nodes.map(n => ({
-    id: n.id,
-    type: n.shape || 'circle',
-    data: n,
-    style: Object.assign({
-      size: n.size,
-      fill: n.color,
-      stroke: n.stroke,
-      lineWidth: n.strokeWidth,
-    }, labelStyle(n), haloStyle(n)),
-  }));
-  const edges = P.edges.map((e, i) => {
-    // Direction is the single most important signal, so encode it REDUNDANTLY:
-    // colour (red=in/green=out) PLUS a non-colour cue (inbound = dashed) so the
-    // graph stays readable for red/green colour-blind users.
-    const isIn = e.direction === 'input' || e.direction === 'incoming';
-    const labelColor = isIn ? '#f85149' : '#3fb950';
-    return {
-      id: 'e' + i,
-      source: e.source,
-      target: e.target,
-      data: e,
-      // quadratic (curved) edges separate parallel/overlapping links so a dense
-      // hub doesn't render as one solid bar of lines
-      type: 'quadratic',
-      style: {
-        stroke: labelColor,
-        lineDash: isIn ? [6, 4] : [0],
-        strokeOpacity: BIG ? 0.32 : 0.6,
-        lineWidth: e.width || 2,
-        endArrow: true,
-        endArrowSize: BIG ? 5 : 8,
-        curveOffset: 18,
-        // Edge label shows ADA amounts / transaction counts inline
-        labelText: e.label || '',
-        labelFontSize: BIG ? 8 : 10,
-        labelFill: labelColor,
-        labelBackground: true,
-        labelBackgroundFill: 'rgba(13,17,23,.8)',
-        labelBackgroundRadius: 3,
-        labelPlacement: 'middle',
-      },
-    };
+  // ---- build graphology graph ----
+  const g = new Graph();
+  // size: payload uses ~30..90 px (G6 scale); Sigma wants smaller units.
+  function nsize(n){ return Math.max(3, (n.size||30)/5); }
+  P.nodes.forEach(n=>{
+    if(g.hasNode(n.id)) return;
+    g.addNode(n.id, {
+      x: Math.cos(g.order) * (1 + g.order*0.001),   // deterministic spread seed
+      y: Math.sin(g.order) * (1 + g.order*0.001),
+      size: nsize(n),
+      color: n.color || '#8b949e',
+      label: n.label || '',
+      atype: n.address_type || 'unknown',
+      always_label: !!n.always_label,
+      is_start: !!n.is_start,
+      cex: n.cex || '', cex_user: n.cex_user || '',
+      raw: n,
+    });
   });
-
-  function layoutOpts(t){
-    switch(t){
-      case 'd3-force': return {type:'d3-force', preventOverlap:true,
-        nodeSize:(d)=> (sizeById[d.id]||30),
-        collide:{strength:1, radius:(d)=> (sizeById[d.id]||30)/2 + COLLIDE_PAD},
-        link:{distance:LINKLEN}, manyBody:{strength:REPULSE},
-        center:{},
-        // Live tick animation gives a smooth settle on SMALL graphs. On big
-        // graphs continuous ticking murders FPS, so compute the layout in one
-        // pass (snap) and force convergence so the simulation stops quickly.
-        animation: !BIG,
-        alphaMin: BIG ? 0.1 : 0.02,
-        alphaDecay: BIG ? 0.06 : 0.028};
-      case 'force-atlas2': return {type:'force-atlas2', preventOverlap:true,
-        kr: Math.max(40, 10 + N/6), kg:6, nodeSize:(d)=> (sizeById[d.id]||30)};
-      case 'antv-dagre': return {type:'antv-dagre', rankdir:'LR',
-        nodesep:26, ranksep:Math.max(70, 110 - N/20)};
-      case 'radial': return {type:'radial', unitRadius:LINKLEN, linkDistance:LINKLEN,
-        preventOverlap:true, nodeSize:(d)=> (sizeById[d.id]||30),
-        focusNode: P.start_id || undefined};
-      case 'concentric': return {type:'concentric', preventOverlap:true,
-        nodeSize:(d)=> (sizeById[d.id]||30)};
-      case 'circular': return {type:'circular'};
-      case 'grid': return {type:'grid'};
-      default: return {type:'d3-force'};
-    }
-  }
-
-  // Default layout: UTXO traces read best as a left→right flow (dagre); address
-  // interaction graphs are hub-and-spoke around the target, so a force network
-  // (or radial) reads better. Big UTXO graphs fall back to force to avoid huge
-  // dagre rank sprawl.
-  const DEFAULT_LAYOUT = KIND === 'utxo' ? (BIG ? 'd3-force' : 'antv-dagre')
-                                         : 'd3-force';
-
-  const {Graph} = G6;
-  const graph = new Graph({
-    container: 'graph',
-    autoResize: true,
-    background: '#0d1117',
-    data: {nodes, edges},
-    layout: layoutOpts(DEFAULT_LAYOUT),
-    node: {state: {selected: {lineWidth: 6, stroke: '#58a6ff'},
-                   inactive: {opacity: 0.18},
-                   active: {lineWidth: 4}}},
-    edge: {style: {endArrow: true},
-           state: {inactive: {strokeOpacity: 0.06},
-                   active: {strokeOpacity: 0.9, lineWidth: 3}}},
-    behaviors: ['zoom-canvas','drag-canvas','drag-element',
-                {type:'click-select', multiple:false},
-                {type:'hover-activate', degree: 1, state:'active',
-                 inactiveState:'inactive'}],
-    // Smooth fade on hover / path-highlight for small graphs. Disabled on big
-    // graphs: tweening every node on each mousemove (hover-activate) is the
-    // other major FPS sink.
-    animation: BIG ? false : {duration: 200, easing: 'ease-in-out'},
-  });
-  // Fit the viewport AFTER the layout settles, not when render() resolves:
-  // force layouts keep moving nodes for several ticks past render, so an
-  // immediate fitView() framed the pre-settle positions and left nodes
-  // drifting out of view. Fit once on the first 'afterlayout' (with a
-  // timeout fallback for instant layouts that fire before this handler).
-  let _fittedOnce = false;
-  function _fitOnce(){
-    if(_fittedOnce) return; _fittedOnce = true;
-    try{ graph.fitView({padding: 30}); }catch(e){ try{ graph.fitView(); }catch(_){} }
-  }
-  graph.on('afterlayout', _fitOnce);
-  graph.render().then(()=>{ setTimeout(_fitOnce, 450); });
-  window.__graph__ = graph;
-  // reflect the chosen default in the layout selector
-  try{ document.getElementById('layout').value = DEFAULT_LAYOUT; }catch(e){}
-
-  // ---- label level-of-detail: reveal labels when zoomed in past 1.4x ----
-  function setLabels(show){
-    if(show === SHOW_LABELS) return;
-    SHOW_LABELS = show;
+  // edge colour: CEX magenta > cex-user orange > direction (in red / out green)
+  const cexNodes = new Set(P.nodes.filter(n=>n.cex).map(n=>n.id));
+  const cexUserNodes = new Set(P.nodes.filter(n=>n.cex_user).map(n=>n.id));
+  P.edges.forEach((e,i)=>{
+    if(!g.hasNode(e.source) || !g.hasNode(e.target)) return;
+    const touchesCex = cexNodes.has(e.source)||cexNodes.has(e.target);
+    const touchesUser = !touchesCex && (cexUserNodes.has(e.source)||cexUserNodes.has(e.target));
+    let col, w=(e.width||2)/2, pre='';
+    if(touchesCex){ col='#d26cff'; w*=1.8; pre='CEX: '; }
+    else if(touchesUser){ col='#ffa657'; w*=1.4; pre='USER: '; }
+    else { const isIn=(e.direction==='input'||e.direction==='incoming');
+           col=isIn?'#f85149':'#3fb950'; }
     try{
-      graph.updateData({nodes: P.nodes.map(n => ({id:n.id, style:{
-        labelText: show ? (n.label||'') : ''}}))});
-      graph.draw();
-    }catch(e){}
-  }
-  graph.on('viewportchange', ()=>{
-    try{ if(BIG) setLabels(graph.getZoom() >= 1.4); }catch(e){}
+      g.addEdgeWithKey('e'+i, e.source, e.target, {
+        size: Math.max(0.6, w),
+        color: col,
+        type: 'arrow',
+        label: pre + (e.label||''),
+        baseColor: col, baseSize: Math.max(0.6, w),
+        raw: e,
+      });
+    }catch(_){ /* parallel/dup edge key collisions: skip safely */ }
   });
 
-  // ---- detail panel ----
-  const detail = document.getElementById('detail');
-  document.getElementById('dclose').onclick = ()=> detail.style.display='none';
-  function fmt(n){ return (typeof n==='number') ? n.toLocaleString() : n; }
-  function showDetail(d){
-    const t = document.getElementById('dtitle');
-    const b = document.getElementById('dbody');
-    let title = KIND==='utxo' ? (d.is_start?'START UTXO':'UTXO')
-                              : (d.is_target?'TARGET ADDRESS':'ADDRESS');
-    if(d.cex) title += ' ['+d.cex+']';
-    else if(d.cex_user) title += ' ['+d.cex_user+' User]';
-    t.textContent = title;
-    const tc = TYPE_COLOR[d.address_type]||'#8b949e';
-    let h = "<div class='kv'>"+d.address+"</div>";
-    h += "<div class='row'><span class='badge' style='background:"+tc+"33;color:"+tc+
-         ";border:1px solid "+tc+"66'>"+d.address_type+"</span></div>";
-    if(KIND==='utxo'){
-      h += "<div class='kv'><b style='color:#f0883e;font-size:16px'>"+fmt(d.ada)+
-           "</b> <span class='muted'>ADA</span><br><span class='muted'>"+
-           fmt(d.lovelace)+" lovelace</span></div>";
-      h += "<div class='muted'>OUTPUT</div><div class='kv'>"+d.tx_hash+"#"+d.output_idx+"</div>";
-      if(d.cex) h += "<div class='kv' style='border-left:3px solid #f85149'>CEX: "+d.cex+"</div>";
-      if(d.assets && d.assets.length){
-        h += "<div class='sec'>ASSETS ("+d.n_assets+")</div>";
-        d.assets.forEach(a=>{ h += "<div class='kv'><code>"+a.unit+"</code><br><b>"+
-          fmt(a.qty)+"</b></div>"; });
-      }
-    } else {
-      h += "<div class='kv'>net <b style='color:"+(d.net_ada>=0?'#3fb950':'#f85149')+
-        "'>"+fmt(d.net_ada)+"</b> ADA<br>"+
-        "<span class='muted'>in "+fmt(d.incoming_ada)+" / out "+fmt(d.outgoing_ada)+
-        " / gross "+fmt(d.total_ada)+"</span></div>";
-      h += "<div class='kv'>"+fmt(d.tx_count)+" tx · depth "+d.depth+"</div>";
-      if(d.cex) h += "<div class='kv' style='border-left:3px solid #f85149'>CEX: "+d.cex+"</div>";
-      else if(d.cex_user) h += "<div class='kv' style='border-left:3px solid #f0883e'>"+d.cex_user+" User <span class='muted'>(direct CEX counterparty)</span></div>";
+  // ---- force layout: run ONCE, chunked with progress, unless cached ----
+  function showOverlay(t){ $('overlay').style.display='flex'; if(t)$('ostat').textContent=t; }
+  function setBar(p,label){ $('barfill').style.width=p+'%'; if(label)$('ocount').textContent=label; }
+  function hideOverlay(){ $('overlay').style.display='none'; }
+
+  async function applyCachedOrLayout(){
+    // try cached positions first → instant open
+    let cached=null;
+    try{ cached = await (await fetch('/viz-state'+(CACHE_KEY?('?k='+encodeURIComponent(CACHE_KEY)):''))).json(); }catch(_){}
+    const pos = cached && cached.node_positions;
+    let applied=0;
+    if(pos){
+      g.forEachNode(id=>{ const p=pos[id]; if(p && isFinite(p.x) && isFinite(p.y)){ g.setNodeAttribute(id,'x',p.x); g.setNodeAttribute(id,'y',p.y); applied++; } });
     }
-    b.innerHTML = h;
-    detail.style.display = 'block';
+    if(applied >= g.order*0.8 && g.order>0){ return; }  // enough cached → skip FA2
+
+    showOverlay('computing layout…');
+    const total = N>6000?100 : N>2000?160 : N>500?260 : 360;
+    const settings = Object.assign(FA2.inferSettings(g), {
+      barnesHutOptimize: N>500, adjustSizes: true, gravity: 1.2, scalingRatio: 12,
+    });
+    const batch = 10; let done=0;
+    while(done<total){
+      const it = Math.min(batch, total-done);
+      try{ FA2.assign(g, {iterations: it, settings}); }catch(err){ break; }
+      done+=it;
+      setBar(Math.round(done/total*100), N.toLocaleString()+' nodes · '+P.edges.length.toLocaleString()+' edges');
+      await new Promise(r=>requestAnimationFrame(r));
+    }
+    // guard against NaN (isolated nodes)
+    g.forEachNode((id,a)=>{ if(!isFinite(a.x)||!isFinite(a.y)){ g.setNodeAttribute(id,'x',Math.random()*100-50); g.setNodeAttribute(id,'y',Math.random()*100-50); } });
   }
-  // ---- full-path highlight: trace a node's whole flow chain (all ancestors
-  //      + descendants), not just its immediate neighbours, so a flow is
-  //      followable end-to-end through hub nodes. ----
-  const outAdj = {};   // src -> [{t, eid}]
-  const inAdj  = {};   // tgt -> [{s, eid}]
-  P.edges.forEach((e, i)=>{
-    const eid = 'e' + i;
-    (outAdj[e.source] = outAdj[e.source] || []).push({n: e.target, eid});
-    (inAdj[e.target]  = inAdj[e.target]  || []).push({n: e.source, eid});
-  });
-  function walk(start, adj, nodeSet, edgeSet){
+  try{ await applyCachedOrLayout(); }catch(err){ /* render anyway with seed positions */ }
+
+  // ---- interaction state ----
+  let hoveredNode=null, selectedNode=null;
+  let pathNodes=null, pathEdges=null;   // null = no highlight
+  const hiddenTypes=new Set();
+
+  // ---- Sigma renderer (WebGL) ----
+  let renderer;
+  try {
+    renderer = new Sigma(g, $('graph'), {
+      renderLabels: true,
+      renderEdgeLabels: true,
+      labelDensity: BIG?0.06:1,
+      labelGridCellSize: 130,
+      labelRenderedSizeThreshold: BIG?15:6,
+      labelColor: {color:'#c9d1d9'},
+      labelFont: 'ui-monospace, Menlo, monospace',
+      defaultEdgeType: 'arrow',
+      enableEdgeEvents: true,
+      zIndex: true,
+      minCameraRatio: 0.02,
+      maxCameraRatio: 50,
+      nodeReducer: (node, data)=>{
+        const res = Object.assign({}, data);
+        if(hiddenTypes.has(data.atype)){ res.hidden=true; return res; }
+        if(data.always_label) res.forceLabel=true;
+        if(pathNodes){
+          if(pathNodes.has(node)){ res.zIndex=2; res.forceLabel = data.always_label || node===selectedNode; }
+          else { res.color='#262b33'; res.label=''; res.forceLabel=false; res.size=Math.max(1.5,(data.size||3)*0.55); res.zIndex=0; }
+        }
+        if(node===hoveredNode || node===selectedNode){ res.zIndex=3; res.forceLabel=true; res.size=(res.size||3)*1.18; }
+        return res;
+      },
+      edgeReducer: (edge, data)=>{
+        const res = Object.assign({}, data);
+        const s=g.source(edge), t=g.target(edge);
+        if(hiddenTypes.size && (hiddenTypes.has(g.getNodeAttribute(s,'atype')) || hiddenTypes.has(g.getNodeAttribute(t,'atype')))){ res.hidden=true; return res; }
+        if(pathEdges){
+          if(!pathEdges.has(edge)){ res.hidden=true; return res; }
+          res.color=data.baseColor; res.size=(data.baseSize||1)*1.7; res.zIndex=2;
+        }
+        // edge labels declutter: only the hovered node's incident edges show them
+        res.label = (hoveredNode && (s===hoveredNode||t===hoveredNode)) ? data.label : '';
+        return res;
+      },
+    });
+  } catch(err){ fatal('renderer init: '+err.message); return; }
+  window.__sigma__ = renderer;
+  hideOverlay();
+  try{ renderer.getCamera().animatedReset({duration:1}); }catch(_){}
+
+  // ---- full-path highlight (all ancestors + descendants through hubs) ----
+  function walk(start, dir, nodeSet, edgeSet){
     const stack=[start];
+    const fn = dir==='out' ? 'forEachOutboundEdge' : 'forEachInboundEdge';
     while(stack.length){
       const cur=stack.pop();
-      (adj[cur]||[]).forEach(({n, eid})=>{
-        edgeSet.add(eid);
-        if(!nodeSet.has(n)){ nodeSet.add(n); stack.push(n); }
+      g[fn](cur, (edge, attr, src, tgt)=>{
+        edgeSet.add(edge);
+        const nb = dir==='out' ? tgt : src;
+        if(!nodeSet.has(nb)){ nodeSet.add(nb); stack.push(nb); }
       });
     }
   }
-  function clearHighlight(){
-    const states={};
-    P.nodes.forEach(n=> states[n.id]='');
-    P.edges.forEach((e,i)=> states['e'+i]='');
-    try{ graph.setElementState(states); }catch(err){}
+  function computePath(start){
+    pathNodes=new Set([start]); pathEdges=new Set();
+    walk(start,'out',pathNodes,pathEdges);
+    walk(start,'in',pathNodes,pathEdges);
   }
-  function highlightPath(id){
-    const nodeSet=new Set([id]), edgeSet=new Set();
-    walk(id, outAdj, nodeSet, edgeSet);   // descendants (downstream flow)
-    walk(id, inAdj,  nodeSet, edgeSet);   // ancestors (upstream flow)
-    const states={};
-    P.nodes.forEach(n=> states[n.id] = nodeSet.has(n.id) ? 'active' : 'inactive');
-    P.edges.forEach((e,i)=> states['e'+i] = edgeSet.has('e'+i) ? 'active' : 'inactive');
-    states[id]='selected';
-    try{ graph.setElementState(states); }catch(err){}
-  }
-  graph.on('node:click', (e)=>{
-    try{
-      const id=e.target.id;
-      const nd=graph.getNodeData(id);
-      if(nd) showDetail(nd.data);
-      highlightPath(id);
-    }
-    catch(err){ console.warn(err); }
-  });
-  // ---- edge tooltip: show full transaction details on click ----
-  graph.on('edge:click', (e)=>{
-    try{
-      const edgeData = e.target;
-      const title = document.getElementById('dtitle');
-      const body = document.getElementById('dbody');
-      title.textContent = 'Transaction Edge';
-      let html = "<div class='kv'>";
-      html += "<b>From:</b> " + edgeData.source + "<br>";
-      html += "<b>To:</b> " + edgeData.target + "<br>";
-      if(edgeData.data.tx_hash) html += "<b>TX:</b> <code>" + edgeData.data.tx_hash + "</code><br>";
-      if(edgeData.data.amount != null) html += "<b>Amount:</b> " + edgeData.data.amount.toFixed(6) + " ADA<br>";
-      if(edgeData.data.interaction_count) html += "<b>Interactions:</b> " + edgeData.data.interaction_count + "<br>";
-      if(edgeData.data.net_ada != null && KIND === 'address') html += "<b>Net ADA:</b> " + edgeData.data.net_ada.toFixed(6) + " ADA<br>";
-      html += "<b>Direction:</b> " + edgeData.data.direction;
-      if(edgeData.data.native_assets && edgeData.data.native_assets.length > 0){
-        html += "<br><b>Native Assets:</b>";
-        for(const asset of edgeData.data.native_assets){
-          html += "<br>&nbsp;&nbsp;• " + asset.quantity.toLocaleString() + " " + asset.name + " (" + asset.policy + ")";
-        }
-      }
-      html += "</div>";
-      body.innerHTML = html;
-      detail.style.display = 'block';
-    } catch(err){ console.warn('edge click', err); }
-  });
-  graph.on('canvas:click', ()=>{ detail.style.display='none'; clearHighlight(); });
+  function clearHighlight(){ selectedNode=null; pathNodes=null; pathEdges=null; }
 
-  // ---- left panel: stats + type filter + legends ----
-  const left = document.getElementById('left');
-  const TYPES = ['wallet','script','byron','stake','unknown'];
-  let html = "<div class='sec' style='color:#58a6ff'>"+P.title+"</div>";
-  html += "<div class='muted'>"+P.stats.nodes+" nodes · "+P.stats.edges+" edges"+
+  // ---- detail panel ----
+  const detail=$('detail');
+  $('dclose').onclick=()=>{ detail.style.display='none'; };
+  function fmt(n){ return (typeof n==='number') ? n.toLocaleString() : n; }
+  function showDetail(d){
+    const t=$('dtitle'), b=$('dbody');
+    let title = KIND==='utxo' ? (d.is_start?'START UTXO':'UTXO')
+                              : (d.is_target?'TARGET ADDRESS':'ADDRESS');
+    if(d.cex) title+=' ['+d.cex+']'; else if(d.cex_user) title+=' ['+d.cex_user+' User]';
+    t.textContent=title;
+    const tc=TYPE_COLOR[d.address_type]||'#8b949e';
+    let h="<div class='kv'>"+d.address+"</div>";
+    h+="<div class='row'><span class='badge' style='background:"+tc+"33;color:"+tc+";border:1px solid "+tc+"66'>"+d.address_type+"</span></div>";
+    if(KIND==='utxo'){
+      h+="<div class='kv'><b style='color:#f0883e;font-size:16px'>"+fmt(d.ada)+"</b> <span class='muted'>ADA</span><br><span class='muted'>"+fmt(d.lovelace)+" lovelace</span></div>";
+      h+="<div class='muted'>OUTPUT</div><div class='kv'>"+d.tx_hash+"#"+d.output_idx+"</div>";
+      if(d.cex) h+="<div class='kv' style='border-left:3px solid #f85149'>CEX: "+d.cex+"</div>";
+      if(d.assets && d.assets.length){
+        h+="<div class='sec'>ASSETS ("+d.n_assets+")</div>";
+        d.assets.forEach(a=>{ h+="<div class='kv'><code>"+a.unit+"</code><br><b>"+fmt(a.qty)+"</b></div>"; });
+      }
+    } else {
+      h+="<div class='kv'>net <b style='color:"+(d.net_ada>=0?'#3fb950':'#f85149')+"'>"+fmt(d.net_ada)+"</b> ADA<br><span class='muted'>in "+fmt(d.incoming_ada)+" / out "+fmt(d.outgoing_ada)+" / gross "+fmt(d.total_ada)+"</span></div>";
+      h+="<div class='kv'>"+fmt(d.tx_count)+" tx · depth "+d.depth+"</div>";
+      if(d.cex) h+="<div class='kv' style='border-left:3px solid #f85149'>CEX: "+d.cex+"</div>";
+      else if(d.cex_user) h+="<div class='kv' style='border-left:3px solid #f0883e'>"+d.cex_user+" User <span class='muted'>(direct CEX counterparty)</span></div>";
+    }
+    b.innerHTML=h; detail.style.display='block';
+  }
+  function showEdgeDetail(e){
+    const t=$('dtitle'), b=$('dbody');
+    t.textContent='Transaction Edge';
+    let h="<div class='kv'>";
+    h+="<b>From:</b> "+e.source+"<br><b>To:</b> "+e.target+"<br>";
+    if(e.tx_hash) h+="<b>TX:</b> <code>"+e.tx_hash+"</code><br>";
+    if(e.amount!=null) h+="<b>Amount:</b> "+Number(e.amount).toFixed(6)+" ADA<br>";
+    if(e.interaction_count) h+="<b>Interactions:</b> "+e.interaction_count+"<br>";
+    if(e.net_ada!=null && KIND==='address') h+="<b>Net ADA:</b> "+Number(e.net_ada).toFixed(6)+" ADA<br>";
+    if(e.direction) h+="<b>Direction:</b> "+e.direction;
+    if(e.native_assets && e.native_assets.length){
+      h+="<br><b>Native Assets:</b>";
+      e.native_assets.forEach(a=>{ h+="<br>&nbsp;&nbsp;• "+Number(a.quantity).toLocaleString()+" "+a.name+" ("+a.policy+")"; });
+    }
+    h+="</div>"; b.innerHTML=h; detail.style.display='block';
+  }
+
+  // ---- events ----
+  renderer.on('enterNode', ({node})=>{ hoveredNode=node; renderer.refresh(); });
+  renderer.on('leaveNode', ()=>{ hoveredNode=null; renderer.refresh(); });
+  renderer.on('clickNode', ({node})=>{ selectedNode=node; computePath(node); showDetail(g.getNodeAttribute(node,'raw')); renderer.refresh(); });
+  renderer.on('clickEdge', ({edge})=>{ showEdgeDetail(g.getEdgeAttribute(edge,'raw')); });
+  renderer.on('clickStage', ()=>{ clearHighlight(); detail.style.display='none'; renderer.refresh(); });
+  document.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ clearHighlight(); detail.style.display='none'; renderer.refresh(); } });
+
+  // ---- left panel ----
+  const left=$('left');
+  const TYPES=['wallet','script','byron','stake','unknown'];
+  let html="<div class='sec' style='color:#58a6ff'>"+P.title+"</div>";
+  html+="<div class='muted'>"+P.stats.nodes+" nodes · "+P.stats.edges+" edges"+
     (P.stats.transactions!=null?(" · "+P.stats.transactions+" tx"):"")+
     (P.direction&&P.direction!=='both'?(" · "+P.direction):"")+"</div>";
-  if(P.error) html += "<div class='kv' style='border-left:3px solid #d29922;color:#d29922'>"+P.error+"</div>";
-  html += "<div class='sec'>Landmarks</div>";
-  html += "<div class='row'><span class='dot' style='background:#ffd700;box-shadow:0 0 6px #ffd700'></span>"+
-    "<span>★ "+(KIND==='utxo'?'start UTXO':'root wallet')+"</span></div>";
-  html += "<div class='row'><span class='dot' style='background:#f85149;box-shadow:0 0 6px #f85149'></span>"+
-    "<span>CEX address</span></div>";
-  if(KIND!=='utxo') html += "<div class='row'><span class='dot' style='background:#f0883e;box-shadow:0 0 5px #f0883e'></span>"+
-    "<span>CEX user (direct counterparty)</span></div>";
-  html += "<div class='row'><span class='muted'>solid = outflow · dashed = inflow</span></div>";
-  html += "<div class='sec' style='color:#58a6ff'>Knowledge Graph</div>";
-  html += "<div class='muted'>Nodes represent ";
-  html += KIND === 'utxo' ? "UTXOs (unspent transaction outputs)" : "Addresses (wallets/scripts)";
-  html += ". Edges represent transactions with semantic flow direction.</div>";
-  html += "<div class='row'><span class='muted'>Edge labels show ADA amounts transferred</span></div>";
-  html += "<div class='row'><span class='muted'>Click an edge for full transaction details</span></div>";
-  html += "<div class='sec'>Type filter</div><div id='types'>";
-  TYPES.forEach(t=>{ html += "<label class='f'><input type='checkbox' checked value='"+t+
-    "'><span class='badge' style='background:"+TYPE_COLOR[t]+"33;color:"+TYPE_COLOR[t]+
-    ";border:1px solid "+TYPE_COLOR[t]+"66'>"+t+"</span></label>"; });
-  html += "</div>";
-  html += "<div class='sec'>Addresses</div>";
+  if(P.error) html+="<div class='kv' style='border-left:3px solid #d29922;color:#d29922'>"+P.error+"</div>";
+  html+="<div class='sec'>Landmarks</div>";
+  html+="<div class='row'><span class='dot' style='background:#ffd700;box-shadow:0 0 6px #ffd700'></span><span>★ "+(KIND==='utxo'?'start UTXO':'root wallet')+"</span></div>";
+  html+="<div class='row'><span class='dot' style='background:#f85149;box-shadow:0 0 6px #f85149'></span><span>CEX address</span></div>";
+  if(KIND!=='utxo') html+="<div class='row'><span class='dot' style='background:#f0883e;box-shadow:0 0 5px #f0883e'></span><span>CEX user (direct counterparty)</span></div>";
+  html+="<div class='row'><span class='muted'>green = outflow · red = inflow · magenta = CEX</span></div>";
+  html+="<div class='sec' style='color:#58a6ff'>Knowledge Graph</div>";
+  html+="<div class='muted'>Nodes represent "+(KIND==='utxo'?"UTXOs (unspent transaction outputs)":"Addresses (wallets/scripts)")+". Click a node to trace its full flow chain; click an edge for transaction details. Hover a node to reveal edge labels.</div>";
+  html+="<div class='sec'>Type filter</div><div id='types'>";
+  TYPES.forEach(t=>{ html+="<label class='f'><input type='checkbox' checked value='"+t+"'><span class='badge' style='background:"+TYPE_COLOR[t]+"33;color:"+TYPE_COLOR[t]+";border:1px solid "+TYPE_COLOR[t]+"66'>"+t+"</span></label>"; });
+  html+="</div>";
+  html+="<div class='sec'>Addresses</div>";
   (P.legend_addrs||[]).forEach(a=>{
-    const star = a.is_target?' ★':''; const cx = a.cex?(' ['+a.cex+']'):'';
-    const cu = (!a.cex && a.cex_user)?(' ['+a.cex_user+' User]'):'';
-    html += "<div class='row'><span class='dot' style='background:"+a.color+"'></span>"+
-      "<code>"+a.short+"</code><span class='muted'>"+
-      (a.tx_count!=null?(a.tx_count+'tx'):'')+star+cx+cu+"</span></div>";
+    const star=a.is_target?' ★':''; const cx=a.cex?(' ['+a.cex+']'):'';
+    const cu=(!a.cex && a.cex_user)?(' ['+a.cex_user+' User]'):'';
+    html+="<div class='row'><span class='dot' style='background:"+a.color+"'></span><code>"+a.short+"</code><span class='muted'>"+(a.tx_count!=null?(a.tx_count+'tx'):'')+star+cx+cu+"</span></div>";
   });
-  if(P.assets && P.assets.length){
-    html += "<div class='sec'>Assets</div>";
-    P.assets.forEach(u=>{ html += "<div class='row'><code>"+u+"</code></div>"; });
-  }
+  if(P.assets && P.assets.length){ html+="<div class='sec'>Assets</div>"; P.assets.forEach(u=>{ html+="<div class='row'><code>"+u+"</code></div>"; }); }
   if(P.cashflow && P.cashflow.length){
-    html += "<div class='sec' style='color:#f0883e'>CexFlow</div>";
+    html+="<div class='sec' style='color:#f0883e'>CexFlow</div>";
     P.cashflow.forEach(c=>{ const col=c.record_type==='withdrawal'?'#3fb950':'#d29922';
-      html += "<div class='row'><span style='color:"+col+"'>●</span><span>"+c.cex+
-        "</span><span class='muted'>"+Math.round(c.amount)+" ADA "+c.confidence+"</span></div>"; });
+      html+="<div class='row'><span style='color:"+col+"'>●</span><span>"+c.cex+"</span><span class='muted'>"+Math.round(c.amount)+" ADA "+c.confidence+"</span></div>"; });
   }
-  left.innerHTML = html;
-
-  function applyFilter(){
-    const active = new Set(
-      [...document.querySelectorAll('#types input:checked')].map(i=>i.value));
-    // hidden node set drives BOTH node + edge visibility — an edge whose
-    // source or target is filtered out must hide too, otherwise dangling
-    // arrows point at nothing.
-    const hidden = new Set();
-    P.nodes.forEach(n=>{
-      const show = active.has(n.address_type);
-      if(!show) hidden.add(n.id);
-      try{ graph.setElementVisibility(n.id, show ? 'visible' : 'hidden'); }catch(err){}
-    });
-    P.edges.forEach((e, i)=>{
-      const vis = (hidden.has(e.source) || hidden.has(e.target)) ? 'hidden' : 'visible';
-      try{ graph.setElementVisibility('e'+i, vis); }catch(err){}
-    });
-    // re-run the current layout so the remaining visible nodes recompact
-    // instead of leaving holes where filtered nodes used to sit
-    try{ graph.draw(); graph.layout(); }catch(err){}
-  }
-  document.getElementById('types').addEventListener('change', applyFilter);
+  left.innerHTML=html;
+  $('types').addEventListener('change', ()=>{
+    hiddenTypes.clear();
+    [...document.querySelectorAll('#types input:not(:checked)')].forEach(i=>hiddenTypes.add(i.value));
+    renderer.refresh();
+  });
 
   // ---- toolbar ----
-  document.getElementById('layout').addEventListener('change', (e)=>{
-    try{
-      graph.setLayout(layoutOpts(e.target.value));
-      graph.layout().then(()=>{ try{ graph.fitView({padding: 30}); }catch(_){} });
-    }
-    catch(err){ console.warn('layout', err); }
-  });
-  document.getElementById('fit').onclick = ()=>{ try{ graph.fitView(); }catch(err){} };
-  document.getElementById('labels').onclick = ()=>{ setLabels(!SHOW_LABELS); };
-  document.getElementById('png').onclick = async ()=>{
-    try{
-      const url = await graph.toDataURL({mode:'overall'});
-      const a=document.createElement('a'); a.href=url; a.download='trace.png'; a.click();
-    }catch(err){ console.warn('png', err); }
-  };
-  const search = document.getElementById('search');
+  $('fit').onclick=()=>{ try{ renderer.getCamera().animatedReset({duration:300}); }catch(_){} };
+  $('labels').onclick=()=>{ const v=!renderer.getSetting('renderLabels'); renderer.setSetting('renderLabels',v); };
+  $('clear').onclick=()=>{ clearHighlight(); detail.style.display='none'; renderer.refresh(); };
+  $('relayout').onclick=async ()=>{ try{
+    showOverlay('re-computing layout…');
+    const settings=Object.assign(FA2.inferSettings(g),{barnesHutOptimize:N>500,adjustSizes:true,gravity:1.2,scalingRatio:12});
+    let done=0; const total=N>2000?160:300;
+    while(done<total){ FA2.assign(g,{iterations:10,settings}); done+=10; setBar(Math.round(done/total*100)); await new Promise(r=>requestAnimationFrame(r)); }
+    hideOverlay(); renderer.refresh(); renderer.getCamera().animatedReset({duration:300});
+  }catch(err){ hideOverlay(); } };
+  $('png').onclick=()=>{ try{
+    const canvases=renderer.getCanvases(); const {width,height}=renderer.getDimensions();
+    const out=document.createElement('canvas'); out.width=width; out.height=height;
+    const ctx=out.getContext('2d'); ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,width,height);
+    ['edges','nodes','edgeLabels','labels'].forEach(k=>{ const c=canvases[k]; if(c) ctx.drawImage(c,0,0,width,height); });
+    const a=document.createElement('a'); a.href=out.toDataURL('image/png'); a.download='trace.png'; a.click();
+  }catch(err){ console.warn('png',err); } };
+  const search=$('search');
   search.addEventListener('keydown', (e)=>{
     if(e.key!=='Enter') return;
-    const q = search.value.trim().toLowerCase(); if(!q) return;
-    const hit = P.nodes.find(n=> (n.address||'').toLowerCase().includes(q) ||
-      (n.id||'').toLowerCase().includes(q) || (n.tx_hash||'').toLowerCase().includes(q));
-    if(hit){ try{ graph.focusElement(hit.id);
-      graph.setElementState(hit.id,'selected'); showDetail(hit); }catch(err){} }
+    const q=search.value.trim().toLowerCase(); if(!q) return;
+    let hit=null;
+    g.forEachNode((id,a)=>{ if(hit) return; const r=a.raw||{};
+      if((r.address||'').toLowerCase().includes(q) || (id||'').toLowerCase().includes(q) || (r.tx_hash||'').toLowerCase().includes(q)) hit=id; });
+    if(hit){ try{
+      selectedNode=hit; computePath(hit); showDetail(g.getNodeAttribute(hit,'raw'));
+      const a=g.getNodeAttribute(hit,'x'), b=g.getNodeAttribute(hit,'y');
+      const disp=renderer.graphToViewport({x:a,y:b});
+      renderer.getCamera().animate(renderer.viewportToFramedGraph(disp), {duration:400, ratio:0.4});
+      renderer.refresh();
+    }catch(err){ console.warn(err); } }
   });
 
-  // ---- viz-state persistence (best effort, never breaks rendering) ----
-  // NOTE: we intentionally do NOT re-apply a saved absolute zoom on load. The
-  // old code called graph.zoomTo(savedZoom) WITHOUT restoring the matching pan,
-  // which stranded the camera off the graph (blank/empty viewport) and also
-  // raced the initial fitView. The auto-fit above always frames the graph
-  // correctly; state is still saved below for potential future full restore.
+  // ---- persist positions + camera so re-opens are instant ----
   if(CACHE_KEY){
     window.addEventListener('beforeunload', ()=>{
       try{
-        const positions = {};
-        graph.getNodeData().forEach(n=>{
-          const p = graph.getElementPosition(n.id);
-          if(p) positions[n.id] = {x:p[0], y:p[1]};
-        });
-        const body = JSON.stringify({zoom: graph.getZoom(), node_positions: positions});
-        navigator.sendBeacon('/viz-state?k='+encodeURIComponent(CACHE_KEY),
-          new Blob([body], {type:'application/json'}));
-      }catch(err){}
+        const positions={}; g.forEachNode((id,a)=>{ positions[id]={x:a.x,y:a.y}; });
+        const cam=renderer.getCamera().getState();
+        const body=JSON.stringify({zoom:cam.ratio, node_positions:positions});
+        navigator.sendBeacon('/viz-state?k='+encodeURIComponent(CACHE_KEY), new Blob([body],{type:'application/json'}));
+      }catch(_){}
     });
   }
 })();
 """
+
 
 
 # ---------------------------------------------------------------------------
@@ -953,8 +870,14 @@ def _open_browser(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _serve(html: str, port: int, cache_key: str) -> None:
+def _serve(payload: dict, port: int, cache_key: str) -> None:
     from utxo_tracer import cache as _cache
+
+    # Encode once, up front. The HTML shell is tiny; the (potentially multi-MB)
+    # graph JSON is served separately at /data and fetched async by the client,
+    # so it never bloats the HTML or gets re-encoded per request.
+    html_bytes = _render_html(payload).encode("utf-8")
+    data_bytes = json.dumps(payload, default=str).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args: Any) -> None:  # silence access log
@@ -979,7 +902,10 @@ def _serve(html: str, port: int, cache_key: str) -> None:
                     state = {}
                 self._send(200, json.dumps(state).encode(), "application/json")
                 return
-            self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+            if self.path.startswith("/data"):
+                self._send(200, data_bytes, "application/json")
+                return
+            self._send(200, html_bytes, "text/html; charset=utf-8")
 
         def do_POST(self) -> None:
             if not self.path.startswith("/viz-state"):
@@ -1006,7 +932,7 @@ def _serve(html: str, port: int, cache_key: str) -> None:
         raise RuntimeError(f"No free port in {port}..{port + 20}")
 
     url = f"http://127.0.0.1:{port}/"
-    print(f"\n  G6 graph → {url}")
+    print(f"\n  Graph (Sigma.js WebGL) → {url}")
     print("  Press Ctrl+C to stop\n")
     threading.Thread(target=lambda: _open_browser(url), daemon=True).start()
     try:
@@ -1032,7 +958,7 @@ def start_server(
 ) -> None:
     payload = build_utxo_payload(result, start_out_ref, cashflow_summary)
     payload["cache_key"] = cache_key
-    _serve(_render_html(payload), port, cache_key)
+    _serve(payload, port, cache_key)
 
 
 def start_address_server(
@@ -1044,4 +970,4 @@ def start_address_server(
 ) -> None:
     payload = build_address_payload(result, target_address)
     payload["cache_key"] = cache_key
-    _serve(_render_html(payload), port, cache_key)
+    _serve(payload, port, cache_key)
