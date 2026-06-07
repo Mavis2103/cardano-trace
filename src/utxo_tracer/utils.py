@@ -136,6 +136,80 @@ def _bech32_to_bytes(address: str) -> bytes | None:
     return bytes(out)
 
 
+def _bech32_polymod(values: list[int]) -> int:
+    """BIP-173 checksum polymod."""
+    gen = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _bech32_hrp_expand(hrp: str) -> list[int]:
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _bech32_create_checksum(hrp: str, data: list[int]) -> list[int]:
+    values = _bech32_hrp_expand(hrp) + data
+    polymod = _bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def _convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> list[int] | None:
+    acc = 0
+    bits = 0
+    ret: list[int] = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def encode_cardano_address(raw: bytes) -> str:
+    """Bech32-encode raw Cardano address bytes (CIP-19), else return hex.
+
+    UTxORPC / CBOR sources deliver addresses as raw header+credential bytes.
+    Every other provider (Blockfrost, Koios, Maestro) yields Bech32
+    (``addr1…`` / ``stake1…``), and ``classify_address`` + CEX matching key off
+    that form — so raw bytes must be re-encoded or they classify as UNKNOWN and
+    never match a CEX address.
+
+    The header byte's high nibble is the address type and the low nibble the
+    network id (1 = mainnet, 0 = testnet). Byron (type 8) and anything
+    unrecognised fall back to a hex string (no Bech32 form).
+    """
+    if not raw:
+        return ""
+    header = raw[0]
+    addr_type = header >> 4
+    network = header & 0x0F
+    if addr_type in (0b1110, 0b1111):  # stake / reward account
+        hrp = "stake" if network == 1 else "stake_test"
+    elif addr_type <= 0b0111:  # Shelley payment addresses (base/pointer/enterprise)
+        hrp = "addr" if network == 1 else "addr_test"
+    else:  # Byron bootstrap (8) or unknown — no Bech32 form
+        return raw.hex()
+    data = _convertbits(raw, 8, 5, True)
+    if data is None:
+        return raw.hex()
+    combined = data + _bech32_create_checksum(hrp, data)
+    return hrp + "1" + "".join(_BECH32[d] for d in combined)
+
+
 def address_stake_key(address: str) -> str | None:
     """Return the hex stake credential of a Cardano base address, else ``None``.
 

@@ -13,6 +13,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from ..models import Asset, OutRef, UTxONode
+from ..utils import encode_cardano_address
 from .base import CapabilityError, Provider
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,49 @@ class UTxORPCProvider(Provider):
         if bi.HasField("big_n_int"):
             return int.from_bytes(bi.big_n_int, "big", signed=True)
         return 0
+
+    async def _read_tx(self, tx_hash: str) -> Optional[dict]:
+        """Fetch a full tx (inputs + outputs) via QueryService.ReadTx.
+
+        ReadTx returns the transaction regardless of whether its outputs are
+        still unspent — unlike ReadUtxos, which only sees the live UTXO set and
+        returns nothing for already-spent (historical) outputs. This is what
+        makes backward tracing work on a UTxORPC node (Dolos).
+
+        The installed SDK (utxorpc 0.2.0) has no ReadTx wrapper, so call the
+        gRPC stub directly. Returns None when ReadTx is UNIMPLEMENTED / errors
+        so the caller can fall back to the ReadUtxos + DumpHistory path.
+        """
+        from utxorpc_spec.utxorpc.v1alpha.query.query_pb2 import ReadTxRequest
+
+        qc = await self._get_query_client()
+        stub = qc.get_async_stub()
+        try:
+            resp = await asyncio.wait_for(
+                stub.ReadTx(
+                    ReadTxRequest(hash=bytes.fromhex(tx_hash)),
+                    metadata=[(k, v) for k, v in self._metadata().items()],
+                ),
+                timeout=self._timeout,
+            )
+        except Exception as e:
+            logger.debug("ReadTx failed for %s: %s", tx_hash, e)
+            return None
+
+        if not resp.HasField("tx") or not resp.tx.HasField("cardano"):
+            return None
+        tx = resp.tx.cardano
+        inputs = [
+            OutRef(tx_hash=inp.tx_hash.hex(), output_index=inp.output_index)
+            for inp in tx.inputs
+            if inp.tx_hash
+        ]
+        outputs = [
+            node
+            for idx, out in enumerate(tx.outputs)
+            if (node := self._parse_tx_output(tx_hash, out, idx)) is not None
+        ]
+        return {"inputs": inputs, "outputs": outputs}
 
     async def _get_query_client(self):
         if self._query_client is not None:
@@ -189,15 +233,24 @@ class UTxORPCProvider(Provider):
         tx_hash_bytes = bytes.fromhex(out_ref.tx_hash)
         ref = TxoRef(hash=tx_hash_bytes, index=out_ref.output_index)
 
+        # ReadUtxos is the cheap path but only sees the live (unspent) UTXO set.
         try:
             resp = await qc.async_read_utxos(keys=[ref])
         except Exception as e:
-            logger.debug("get_utxo_by_out_ref failed: %s", e)
-            return None
+            logger.debug("get_utxo_by_out_ref ReadUtxos failed: %s", e)
+            resp = None
 
-        if not resp.items:
-            return None
-        return self._parse_utxo_data(out_ref.tx_hash, resp.items[0])
+        if resp is not None and resp.items:
+            return self._parse_utxo_data(out_ref.tx_hash, resp.items[0])
+
+        # Spent (or pruned from the UTXO set) — recover via ReadTx, which still
+        # returns the producing transaction's outputs.
+        tx = await self._read_tx(out_ref.tx_hash)
+        if tx:
+            for node in tx["outputs"]:
+                if node.out_ref.output_index == out_ref.output_index:
+                    return node
+        return None
 
     # ── Transaction lookup ────────────────────────────────────────────
 
@@ -205,24 +258,33 @@ class UTxORPCProvider(Provider):
         if tx_hash in self._tx_cache:
             return self._tx_cache[tx_hash]
 
-        qc = await self._get_query_client()
-        outputs = await self._probe_outputs(qc, tx_hash)
+        # Primary path: ReadTx returns inputs + outputs for any tx, spent or
+        # not. ReadUtxos (used below) only sees the live UTXO set, so it returns
+        # no outputs for historical txs — making backward tracing impossible.
+        result = await self._read_tx(tx_hash)
 
-        if not outputs:
-            return {"inputs": [], "outputs": []}
+        if result is None:
+            # ReadTx unavailable (older/limited server): fall back to ReadUtxos
+            # for outputs + DumpHistory block scan for inputs.
+            qc = await self._get_query_client()
+            outputs = await self._probe_outputs(qc, tx_hash)
 
-        # DumpHistory may be UNIMPLEMENTED on some servers (e.g. Demeter.run)
-        inputs = await self._scan_for_tx_inputs(tx_hash)
+            if not outputs:
+                return {"inputs": [], "outputs": []}
 
-        # If we got outputs but no inputs, this provider can't trace backward
-        # — raise CapabilityError so fallback chain can try the next provider
-        if not inputs and outputs:
-            raise CapabilityError(
-                self.provider_type,
-                "DumpHistory not available — can't trace backward",
-            )
+            # DumpHistory may be UNIMPLEMENTED on some servers (e.g. Demeter.run)
+            inputs = await self._scan_for_tx_inputs(tx_hash)
 
-        result = {"inputs": inputs, "outputs": outputs}
+            # If we got outputs but no inputs, this provider can't trace backward
+            # — raise CapabilityError so fallback chain can try the next provider
+            if not inputs and outputs:
+                raise CapabilityError(
+                    self.provider_type,
+                    "DumpHistory not available — can't trace backward",
+                )
+
+            result = {"inputs": inputs, "outputs": outputs}
+
         self._tx_cache[tx_hash] = result
         if len(self._tx_cache) > MAX_CACHE_SIZE:
             oldest_key = next(iter(self._tx_cache))
@@ -381,7 +443,10 @@ class UTxORPCProvider(Provider):
 
     def _parse_tx_output(self, tx_hash: str, out, idx: int) -> Optional[UTxONode]:
         """Parse a TxOutput from SDK response into UTxONode."""
-        address = out.address.hex() if out.address else ""
+        # UTxORPC delivers addresses as raw header+credential bytes; re-encode to
+        # Bech32 (addr1…/stake1…) so classify_address + CEX matching work the same
+        # as every other provider.
+        address = encode_cardano_address(bytes(out.address)) if out.address else ""
         lovelace = self._bigint_value(out.coin)
 
         assets: list = []
